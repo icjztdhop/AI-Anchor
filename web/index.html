@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>虚拟主播控制台</title>
+  <link rel="stylesheet" href="app.css" />
+  <link rel="shortcut icon" href="favicon.svg" type="image/svg">
+</head>
+
+<body>
+  <!-- 顶部 -->
+  <header class="top">
+    <div class="title">虚拟主播控制台</div>
+  </header>
+
+  <!-- 主体 -->
+  <main class="layout">
+
+    <!-- 左侧：尽量一页内显示 -->
+    <section class="panel panel-left">
+      <section class="card leftStack">
+
+        <div class="row-between">
+          <div class="h">连接</div>
+          <span id="status" class="pill muted">DISCONNECTED</span>
+        </div>
+
+        <div class="grid compact">
+          <label>API_BASE
+            <input id="apiBase" value="http://127.0.0.1:8000" />
+          </label>
+          <label>user_id
+            <input id="userId" value="default_room" />
+          </label>
+          <label>昵称
+            <input id="nickname" value="路人甲" />
+          </label>
+          <label class="row">
+            <input id="enableTts" type="checkbox" checked />
+            <span>开启 TTS</span>
+          </label>
+        </div>
+
+        <div class="actions">
+          <button id="btnConnect">连接 WS</button>
+          <button id="btnStop" disabled>断开</button>
+        </div>
+
+        <hr />
+
+        <div class="row-between">
+          <div class="h">语音播放</div>
+          <div class="muted">队列 <span id="qsize">0</span></div>
+        </div>
+
+        <audio id="player" controls playsinline preload="auto"></audio>
+
+        <div class="now">
+          <div class="muted">正在朗读</div>
+          <div id="nowText" class="nowText">（暂无）</div>
+        </div>
+
+        <div class="queueWrap">
+          <ul id="segList" class="segList"></ul>
+        </div>
+      </section>
+    </section>
+
+    <!-- 中间：对话 + 输入 -->
+    <section class="panel panel-center">
+      <section class="card chatCard">
+        <div class="h">对话</div>
+
+        <!-- 对话气泡 -->
+        <div id="chat" class="chatBubbles"></div>
+
+        <!-- 输入区（固定在中间底部） -->
+        <div class="chatInput">
+          <textarea
+            id="danmaku"
+            placeholder="在这里输入你想说的话…（Ctrl / ⌘ + Enter 发送）"></textarea>
+
+          <div class="row-between">
+            <div></div>
+            <button id="btnSend" class="primary" disabled>发送</button>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <!-- 右侧：Live2D -->
+    <section class="panel panel-right">
+      <section class="card">
+        <div class="row-between">
+          <div class="h">Live2D</div>
+          <span id="live2dStatus" class="pill muted">未加载</span>
+        </div>
+
+        <canvas id="live2dCanvas"></canvas>
+
+        <div class="live2dCtl">
+          <label>模型 URL
+            <input id="live2dModelUrl"
+              value="/Live2D/hiyori/hiyori_pro_t11.model3.json" />
+          </label>
+          <button id="btnLoadLive2D" class="primary">加载模型</button>
+        </div>
+      </section>
+    </section>
+
+  </main>
+
+  <!-- Live2D 依赖 -->
+  <script src="vendor/pixi.min.js"></script>
+  <script src="vendor/live2dcubismcore.min.js"></script>
+  <script src="vendor/pixi-live2d-display.cubism4.min.js"></script>
+
+  <!-- Live2D -->
+  <script src="live2d.js"></script>
+
+  <!-- 主逻辑 -->
+  <script src="app.js"></script>
+</body>
+</html>
