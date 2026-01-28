@@ -1,6 +1,6 @@
 ﻿<div align="center">
 <img alt="icon-512.png" height="80" src="web/favicon.png"/>
-<h1>AI Anchor</h1>
+<h1>AI Anchor</h1></div>
 
 
 # AI Anchor
