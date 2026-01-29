@@ -1,0 +1,155 @@
+﻿# ==================================================
+# 项目根配置（start_all.bat 所在目录）
+# ==================================================
+
+# 是否启用 RAG（会引入 torch，启动慢）
+# ==================================================
+RAG_ENABLED=1
+
+
+# ==================================================
+# GPT-SoVITS（TTS 服务）
+# ==================================================
+
+GPTSOVITS_DIR=GPT-SoVITS
+GPTSOVITS_API=GPT-SoVITS\api_v2.py
+GPTSOVITS_HOST=0.0.0.0
+GPTSOVITS_PORT=9880
+GPTSOVITS_REDIRECT_LOG=0
+GPTSOVITS_ARGS=
+
+# smart_anchor.py 调用用
+GPTSOVITS_URL=http://127.0.0.1:9880
+TTS_REF_AUDIO_PATH=GPT-SoVITS\ref\default.wav
+TTS_PROMPT_TEXT=为什么抛弃更高效更坚固的形态？
+
+# TTS 参数（smart_anchor.py 读取，env > config > 默认）
+TTS_TEXT_LANG=zh
+TTS_PROMPT_LANG=zh
+TTS_MEDIA_TYPE=wav
+# 是否开启一次性 TTS 的 streaming_mode（tts_to_file payload 用）
+TTS_STREAMING_MODE=0
+# 流式返回 iter_content chunk 大小（bytes）
+TTS_STREAM_CHUNK_SIZE=65536
+
+
+# ==================================================
+# LMDeploy（LLM 服务）
+# ==================================================
+
+LMDEPLOY_SUBCMD=serve api_server
+LMDEPLOY_MODEL_PATH=model\internlm2_5-7b-chat-int4
+LMDEPLOY_BACKEND=turbomind
+LMDEPLOY_MODEL_FORMAT=awq
+LMDEPLOY_MODEL_NAME=internlm2_5_7b_chat_awq_int4
+
+LMDEPLOY_SERVER_NAME=0.0.0.0
+LMDEPLOY_SERVER_PORT=23333
+LMDEPLOY_TP=1
+LMDEPLOY_SESSION_LEN=2048
+LMDEPLOY_CACHE_MAX_ENTRY_COUNT=0.35
+
+# API Server & health check 使用
+LMDEPLOY_HOST=127.0.0.1
+LMDEPLOY_PORT=23333
+
+
+# ==================================================
+# API Server（api_server_backup.py 实际读取）
+# ==================================================
+
+API_ENTRY=api_server.py
+API_HOST=0.0.0.0
+API_PORT=8000
+API_RELOAD=false
+API_LOG_LEVEL=info
+
+# 可选：浏览器自动打开用（不写则 http://127.0.0.1:{API_PORT}）
+# API_PUBLIC_BASE_URL=http://127.0.0.1:8000
+
+DISABLE_AUTO_OPEN=0
+AUTO_OPEN_DELAY_MS=600
+
+# CORS
+CORS_ALLOW_ORIGINS=*
+CORS_ALLOW_CREDENTIALS=true
+CORS_ALLOW_METHODS=*
+CORS_ALLOW_HEADERS=*
+
+# 静态资源
+STATIC_WEB_PATH=web
+STATIC_LIVE2D_PATH=Live2D
+
+# 数据目录
+DATA_TTS_DIR=data/tts
+DATA_LIVE_SESSIONS_DIR=data/live_sessions
+
+# 默认会话
+DEFAULT_ROOM=default_room
+DEFAULT_SENDER_NAME=路人甲
+
+# 调试
+DEBUG_LLM_STREAM=0
+DEBUG_LLM_MAX_CHARS=200
+
+# health check
+HEALTH_CHECK_TIMEOUT_SECONDS=5
+
+
+# ==================================================
+# 主播人格 / 知识库（smart_anchor）
+# ==================================================
+
+ANCHOR_NAME=小爱
+ANCHOR_AGE=22
+ANCHOR_TRAITS=活泼,开朗,细心
+ANCHOR_INTERESTS=游戏,音乐,动漫
+ANCHOR_STYLE=直播间口吻：热情、会@观众、互动感强，简短有梗
+ANCHOR_SYSTEM_PROMPT=你正在直播，请始终以主播身份回应观众，不要提及你是AI模型。
+ANCHOR_PERSONALITY=你是一个亲切自然的虚拟主播，说话口语化，喜欢和观众互动，但不会胡编事实。
+ANCHOR_WELCOME_MESSAGE=欢迎来到我的直播间！有什么想聊的吗？
+ANCHOR_GOODBYE_MESSAGE=今天的直播就到这里啦，大家晚安！
+
+ANCHOR_MAX_RESPONSE_LENGTH=500
+ANCHOR_TEMPERATURE=0.7
+ANCHOR_TOP_P=0.9
+ANCHOR_MAX_TOKENS=300
+
+KNOWLEDGE_TXT=knowledge.txt
+
+
+# ==================================================
+# 流式 / TTS 行为（get_runtime_config 读取）
+# ==================================================
+
+STREAM_LLM=1
+STREAM_TTS_CHUNKED=1
+
+TTS_WORKERS=2
+MIN_TTS_CHARS=6
+MAX_PENDING_CHARS=160
+FLUSH_MAX_SEGMENTS=2
+POLL_INTERVAL_MS=10
+
+
+# ==================================================
+# 情绪模块（LLM → Emotion → TTS / Live2D）
+# ==================================================
+
+EMOTION_ENABLED=1
+EMOTION_LABELS=正常,开心,失落,疑惑,惊讶,生气
+EMOTION_DEFAULT=正常
+
+EMOTION_SYSTEM_PROMPT=你是一个有情感的主播，请在每次回复的末尾添加一个情感标签，格式为【emo=XXX】，XXX必须是以下情感之一：{EMOTION_LABELS}。\n\n重要规则：\n1. 每次回复必须有且只有一个情感标签\n2. 情感标签放在回复的末尾
+
+# Live2D 动作映射
+EMOTION_MAP_正常=Tap,0
+EMOTION_MAP_开心=Tap,1|FlickUp,0
+EMOTION_MAP_失落=Flick@Body,0
+EMOTION_MAP_疑惑=Flick,0
+EMOTION_MAP_惊讶=FlickDown,0
+EMOTION_MAP_生气=Tap@Body,0
+
+# 情绪调试
+DEBUG_TTS=1
+DEBUG_EMOTION=1

@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+requests
+aiofiles
+llama-index
+llama-index-embeddings-huggingface
+llama-index-vector-stores-faiss
+sentence-transformers
+faiss-cpu
