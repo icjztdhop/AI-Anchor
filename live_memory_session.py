@@ -1,32 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-live_memory_session.py
-======================
-单主播“上下文记忆 -> 本次直播记忆 -> 长期记忆”管线脚本（可独立跑，也可被服务端引入）。
 
-规则：
-1) 上下文记忆：对话消息列表（短期）
-2) 当上下文超过模型 max_token（估算）时：
-   - 将较早的上下文压缩成“本次直播记忆”（live_memory，按段落累积）
-   - 上下文只保留最近 N 条消息继续对话
-3) 直播结束时：把“本次直播记忆”写入长期记忆（RAGMemoryManager）
-
-依赖：
-- smart_anchor.py 里的 SmartVirtualAnchor
-- （可选）rag_memory.py / llama-index：用于长期记忆；没有则只生成本次直播记忆文件
-
-用法（交互式）：
-  python live_memory_session.py --user_id room_001 --sender_name 路人甲
-  输入弹幕后回车；输入 /end 结束直播并落长期记忆。
-  输入 /stats 查看状态。
-
-非交互式：
-  python live_memory_session.py --lines "你好" "你们营业时间？" "再见" --end
-
-可选：如果你想让“超限阈值”更小一点便于测试：
-  python live_memory_session.py --max_ctx_tokens 400
-"""
 
 from __future__ import annotations
 
@@ -111,10 +85,27 @@ class LiveMemoryManager:
             "",
             "【输出：直播记忆摘要】",
         ]).strip()
-        return self.anchor._call_lmdeploy(prompt, temperature=self.summary_temperature).strip()
+        # 兼容 smart_anchor._call_lmdeploy 不支持 temperature 参数的情况：临时覆盖 anchor 温度
+        old = getattr(self.anchor, "llm_temperature", None)
+        try:
+            if old is not None:
+                self.anchor.llm_temperature = self.summary_temperature
+            return self.anchor._call_lmdeploy(prompt).strip()
+        finally:
+            if old is not None:
+                self.anchor.llm_temperature = old
 
     def maybe_compact_context(self) -> Optional[Dict[str, Any]]:
-        session = self.anchor._get_session(self.user_id)
+        # ---- 确保结束时生成一次“整场直播摘要”，用于写入 live_memory 与 RAG ----
+        try:
+            msgs = session.memory.messages or []
+            if msgs:
+                ctx_text = build_ctx_text(msgs, self.anchor.anchor_name)
+                final_summary = self._summarize_to_live_memory(ctx_text)
+                self.live.add_chunk(final_summary)
+        except Exception:
+            # 总结失败也不能影响落盘
+            pass
         msgs = session.memory.messages
         if not msgs:
             return None
@@ -228,7 +219,7 @@ class LiveMemoryManager:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--user_id", default=os.environ.get("USER_ID", "room_001"))
-    ap.add_argument("--sender_name", default=os.environ.get("SENDER_NAME", "路人甲"))
+    ap.add_argument("--sender_name", default=os.environ.get("SENDER_NAME", "用户"))
     ap.add_argument("--lmdeploy_url", default=os.environ.get("LMDEPLOY_URL", "http://localhost:23333"))
     ap.add_argument("--knowledge_txt", default=os.environ.get("KNOWLEDGE_TXT", "knowledge.txt"))
     ap.add_argument("--max_ctx_tokens", type=int, default=int(os.environ.get("MAX_CTX_TOKENS", "1800")))

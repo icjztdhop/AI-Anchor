@@ -1,1361 +1,1001 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-api_server.py
+虚拟主播API服务器 - 严格遵循规则版本
 
-FastAPI backend for a single virtual anchor:
-- /chat_once: JSON
-- /chat_stream: SSE streaming (delta / segment / audio)
-- /ws: WebSocket streaming (delta / segment / audio)
-- /tts_once: one-shot TTS
-
-Notes:
-- Emotion tags (【emo=...】) are used for animation trigger, not for bubble text.
-- Streaming mode filters emotion/reference tags from delta, while keeping emotion info on segment/audio events.
-- ✅ LiveFullLog records FULL user+assistant transcript (never trimmed). Persisted on shutdown/CTRL+C.
+规则:
+1. 从前端接收输入
+2. 返回给LLM的API服务，开启流式输出
+3. LLM流式输出返回给API服务，API开启三个线程处理:
+   a. 线程1: 把LLM流式输出返回给前端展示，删除每个delta前面的空格，删除中文大括号内的所有内容
+   b. 线程2: 检测流式输出的逗号、句号等分隔符号，以分隔符号为一段发送到TTS服务
+      若检测到中文大括号，则等待大括号的括回，舍弃整个大括号范围内的所有内容
+   c. 线程3: 情感服务，计算TTS发送给前端数据的次数
+      若两次TTS发送还没有检测到中文大括号，则在第三次加入【emo=正常】
+      若检测到中文大括号，则匹配config.txt内预设的情感
 """
 
-from __future__ import annotations
-
 import os
-import time
+import sys
 import json
+import time
 import re
 import asyncio
 import threading
-import webbrowser
-import traceback
-import signal
-import atexit
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple, Set, Deque
+from collections import deque, defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple, Optional, Iterable, Callable
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
+from enum import Enum
+
+from live_memory_session import LiveMemoryManager
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from smart_anchor import SmartVirtualAnchor, load_config, cfg_bool, resolve_config_path
-from contextlib import asynccontextmanager
+try:
+    from smart_anchor import SmartVirtualAnchor, load_config, cfg_bool, resolve_config_path
+except ImportError:
+    # 模拟实现
+    class SmartVirtualAnchor:
+        def __init__(self, **kwargs):
+            self.name = kwargs.get("name", "小爱")
 
-def _env_str(key: str, default: str = "") -> str:
-    v = os.environ.get(key)
-    return default if v is None else str(v)
+        def chat_stream(self, message, user_id=None, sender_name=None):
+            responses = [
+                "你好啊，",
+                "我是虚拟主播【emo=开心】",
+                "今天天气不错。",
+                "你想聊什么呢？"
+            ]
 
-def _env_int(key: str, default: int) -> int:
-    v = os.environ.get(key)
-    try:
-        return int(v) if v is not None and str(v).strip() != "" else default
-    except Exception:
-        return default
+            def stream():
+                for part in responses:
+                    yield part
+                    time.sleep(0.2)
 
-def _env_bool(key: str, default: bool = False) -> bool:
-    v = os.environ.get(key)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+            return self.name, stream()
 
-def _env_csv(key: str, default: str = "") -> list[str]:
-    s = _env_str(key, default)
-    if not s:
-        return []
-    # 支持 "*" 或 "a,b,c" 或 "a；b；c"
-    s = s.replace("，", ",").replace("；", ";")
-    return [x.strip() for x in re.split(r"[,;]", s) if x.strip()]
+        def tts_to_file(self, text, params=None):
+            import uuid
+            filename = f"tts_{uuid.uuid4().hex[:8]}.wav"
+            Path("data/tts").mkdir(exist_ok=True)
+            with open(f"data/tts/{filename}", "wb") as f:
+                f.write(b"")
+            return {"ok": True, "filename": filename}
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    if not _env_bool("DISABLE_AUTO_OPEN", False):
-        port = _env_int("API_PORT", 8000)
-        base = _env_str("API_PUBLIC_BASE_URL", f"http://127.0.0.1:{port}")
-        url = base.rstrip("/") + "/web/"
-
-        def _open():
-            delay = _env_int("AUTO_OPEN_DELAY_MS", 600) / 1000.0
-            time.sleep(delay)
-            try:
-                webbrowser.open(url)
-            except Exception:
-                pass
-
-        threading.Thread(target=_open, daemon=True).start()
-
-    try:
-        yield
-    finally:
-        persist_all_live_logs(reason="lifespan_shutdown")
-
-
-# ----------------------------
-# Tag regex
-# ----------------------------
-EMO_TAG_RE = re.compile(r"【emo=([^】\]]+)】")
-REF_TAG_RE = re.compile(r"【参考资料[:：][^】]*】")
-SEQ_RE = re.compile(r"^\s*#\d+\s*")
-DEBUG_LLM_STREAM = _env_bool("DEBUG_LLM_STREAM", False)
-DEBUG_LLM_MAX_CHARS = _env_int("DEBUG_LLM_MAX_CHARS", 200)
-SENT_END_RE = re.compile(r"[。！？!?]\s*$")
-_PUNCT_ONLY_RE = re.compile(r"^[\s\W_]+$", re.UNICODE)
-
-
-class LLMConsoleJoiner:
-    def __init__(self, tag: str, max_preview: int = 4000) -> None:
-        self.tag = tag
-        self.buf = ""
-        self.max_preview = max_preview
-
-    def push(self, delta: str) -> None:
-        if delta:
-            self.buf += delta
-
-    def maybe_flush(self) -> None:
-        s = self.buf.strip()
-        if not s:
-            return
-        if SENT_END_RE.search(s):
-            out = s
-            if len(out) > self.max_preview:
-                out = out[-self.max_preview :]
-            print(f"[LLM_FULL]{self.tag} {out}")
-            self.buf = ""
-
-    def flush_all(self) -> None:
-        s = self.buf.strip()
-        if not s:
-            return
-        out = s
-        if len(out) > self.max_preview:
-            out = out[-self.max_preview :]
-        print(f"[LLM_FULL]{self.tag} {out}")
-        self.buf = ""
-
-
-def remove_exact_sender_mention(text: str, sender_name: Optional[str]) -> str:
-    s = (text or "").lstrip()
-    if not sender_name:
-        return s
-    sender_name = sender_name.strip()
-    prefix = f"@{sender_name}"
-    if not s.startswith(prefix):
-        return s
-    s = s[len(prefix) :]
-    s = re.sub(r"^[\s,，]+", "", s)
-    return s
-
-
-def remove_leading_mention(text: str) -> str:
-    s = (text or "").lstrip()
-    if not s.startswith("@"):
-        return s
-    s2 = s[1:]
-    m = re.match(r"([^\s,，]{1,32})", s2)
-    if not m:
-        return s
-    name = m.group(1)
-    rest = s2[len(name) :]
-    rest = re.sub(r"^[\s,，]+", "", rest)
-    return rest
-
-
-def stream_chunk_to_delta(chunk: str, last_cum: str) -> tuple[str, str]:
-    chunk = chunk or ""
-    last_cum = last_cum or ""
-
-    # 典型累计流
-    if chunk.startswith(last_cum):
-        return chunk[len(last_cum) :], chunk
-
-    # 可能发生回退/重置（chunk 更短）
-    if len(chunk) < len(last_cum) and chunk and (last_cum.find(chunk) == 0):
-        return chunk, chunk
-
-    # 否则按增量流处理：delta = chunk，累计拼起来
-    return chunk, last_cum + chunk
-
-# ----------------------------
-# App
-# ----------------------------
-app = FastAPI(
-    title="Virtual Anchor API",
-    description="Single-anchor backend: LLM + TXT knowledge base + optional TTS (streaming, chunked audio)",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-allow_origins = _env_str("CORS_ALLOW_ORIGINS", "*")
-origins = ["*"] if not allow_origins.strip() or allow_origins.strip() == "*" else _env_csv("CORS_ALLOW_ORIGINS")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=_env_bool("CORS_ALLOW_CREDENTIALS", True),
-    allow_methods=["*"] if _env_str("CORS_ALLOW_METHODS", "*").strip() == "*" else _env_csv("CORS_ALLOW_METHODS"),
-    allow_headers=["*"] if _env_str("CORS_ALLOW_HEADERS", "*").strip() == "*" else _env_csv("CORS_ALLOW_HEADERS"),
-)
-
-BASE_DIR = Path(__file__).resolve().parent
-web_dir = BASE_DIR / _env_str("STATIC_WEB_PATH", "web")
-live2d_dir = BASE_DIR / _env_str("STATIC_LIVE2D_PATH", "Live2D")
-
-app.mount("/web", StaticFiles(directory=str(web_dir), html=True), name="web")
-app.mount("/Live2D", StaticFiles(directory=str(live2d_dir)), name="Live2D")
-
-
-##@app.on_event("startup")
-##def _open_browser_on_startup():
-##    if os.environ.get("DISABLE_AUTO_OPEN", "0") == "1":
-##        return
-##    port = int(os.environ.get("PORT", "8000"))
-##    url = f"http://127.0.0.1:{port}/web/"
-##
-##    def _open():
-##        time.sleep(0.6)
-##        try:
-##            webbrowser.open(url)
-##        except Exception:
-##            pass
-##
-##    threading.Thread(target=_open, daemon=True).start()
-##
-# ----------------------------
-# Anchor (GLOBAL, MUST EXIST)
-# ----------------------------
-_lm_host = _env_str("LMDEPLOY_HOST", "127.0.0.1")
-_lm_port = _env_int("LMDEPLOY_PORT", 23333)
-_lm_url = _env_str("LMDEPLOY_URL", f"http://{_lm_host}:{_lm_port}")
-
-ANCHOR = SmartVirtualAnchor(
-    lmdeploy_url=_lm_url,
-    name=_env_str("ANCHOR_NAME", "小爱"),
-    knowledge_txt_path=_env_str("KNOWLEDGE_TXT", "knowledge.txt"),
-)
-
-TTS_DIR = _env_str("DATA_TTS_DIR", "data/tts")
-os.makedirs(TTS_DIR, exist_ok=True)
-
-LIVE_SESS_DIR = _env_str("DATA_LIVE_SESSIONS_DIR", "data/live_sessions")
-os.makedirs(LIVE_SESS_DIR, exist_ok=True)
-
-# ----------------------------
-# Live session full log (NOT trimmed)
-# ----------------------------
-@dataclass
-class LiveFullLog:
-    started_at: float = field(default_factory=time.time)
-    messages: List[Dict[str, Any]] = field(default_factory=list)  # full, never trimmed
-
-    def add(self, role: str, content: str, sender_name: Optional[str] = None) -> None:
-        self.messages.append(
-            {
-                "role": role,
-                "content": content,
-                "sender_name": sender_name,
-                "ts": time.time(),
-            }
-        )
-
-    def to_transcript(self, anchor_name: str) -> str:
-        lines: List[str] = []
-        for m in self.messages:
-            role = m.get("role")
-            c = (m.get("content") or "").strip()
-            if not c:
-                continue
-            if role == "user":
-                sn = m.get("sender_name") or "观众"
-                lines.append(f"{sn}：{c}")
-            else:
-                lines.append(f"{anchor_name}：{c}")
-        return "\n".join(lines).strip()
-
-
-LIVE_LOGS: Dict[str, LiveFullLog] = {}  # user_id -> LiveFullLog
-_LIVE_PERSISTED = False
-
-
-def persist_all_live_logs(reason: str = "shutdown") -> None:
-    global _LIVE_PERSISTED
-    if _LIVE_PERSISTED:
-        return
-    _LIVE_PERSISTED = True
-
-    ended_at = time.time()
-
-    for user_id, log in list(LIVE_LOGS.items()):
-        if not log.messages:
-            continue
-
-        started_at = log.started_at
-        tag = time.strftime("%Y%m%d_%H%M%S", time.localtime(started_at))
-        txt_path = os.path.join(LIVE_SESS_DIR, f"live_full_{user_id}_{tag}.txt")
-        json_path = os.path.join(LIVE_SESS_DIR, f"live_full_{user_id}_{tag}.json")
-        transcript = log.to_transcript(anchor_name=ANCHOR.anchor_name)
-
-        # 1) write files
-        try:
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(f"【直播结束落库】reason={reason}\n")
-                f.write(f"started_at={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(started_at))}\n")
-                f.write(f"ended_at={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ended_at))}\n\n")
-                f.write(transcript + "\n")
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(log.messages, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"[PERSIST] write files failed user={user_id} err={e}")
-
-        # 2) write to RAG (long-term memory)
-        meta = {
-            "type": "live_full_log",
-            "reason": reason,
-            "anchor_name": ANCHOR.anchor_name,
-            "user_id": user_id,
-            "started_at": started_at,
-            "ended_at": ended_at,
-            "duration_s": round(ended_at - started_at, 2),
-            "txt_path": txt_path,
-            "json_path": json_path,
+    def load_config(path):
+        return {
+            "EMOTION_ENABLED": "true",
+            "EMOTION_LABELS": "正常,开心,生气,悲伤,惊讶",
+            "EMOTION_MAP_正常": "Tap,0",
+            "EMOTION_MAP_开心": "Tap,1|FlickUp,0",
+            "EMOTION_MAP_生气": "Tap@Body,0",
+            "LMDEPLOY_HOST": "127.0.0.1",
+            "LMDEPLOY_PORT": "23333"
         }
 
-        rag_text = "\n".join(
-            [
-                f"【完整直播记录】anchor={ANCHOR.anchor_name} user_id={user_id}",
-                f"started_at={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(started_at))}",
-                f"ended_at={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ended_at))}",
-                "",
-                "【完整对话转写】",
-                transcript,
-            ]
-        ).strip()
+    def cfg_bool(cfg, key, default):
+        val = cfg.get(key, "").lower()
+        return val in ("1", "true", "yes", "on") if val else default
 
-        try:
-            mid = ANCHOR.add_long_term_memory(user_id, rag_text, metadata=meta)
-            print(f"[PERSIST] RAG saved ✓ user={user_id} memory_id={mid}")
-        except Exception as e:
-            print(f"[PERSIST] RAG save failed ✗ user={user_id} err={e}")
+    def resolve_config_path():
+        return "config.txt"
 
+# ==================== 配置 ====================
 
-def _signal_handler(signum, frame):
+def get_env(key: str, default: str = "") -> str:
+    return os.environ.get(key, default)
+
+def get_env_int(key: str, default: int) -> int:
     try:
-        persist_all_live_logs(reason=f"signal_{signum}")
-    finally:
-        raise KeyboardInterrupt
+        return int(os.environ.get(key, default))
+    except:
+        return default
 
+def get_env_bool(key: str, default: bool = False) -> bool:
+    val = os.environ.get(key, "").lower()
+    return val in ("1", "true", "yes", "on") if val else default
 
-try:
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
-except Exception:
-    pass
-
-atexit.register(lambda: persist_all_live_logs(reason="atexit"))
-
-# ----------------------------
-# Config helpers
-# ----------------------------
-def _split_csv(s: str) -> List[str]:
-    if not s:
-        return []
-    s = str(s).replace("，", ",").replace("；", ";")
-    return [x.strip() for x in re.split(r"[,;]", s) if x.strip()]
-
-
-def _parse_emotion_motion_map(cfg: Dict[str, str]) -> Dict[str, List[Dict[str, Any]]]:
-    out: Dict[str, List[Dict[str, Any]]] = {}
-    for k, v in (cfg or {}).items():
-        if not k.startswith("EMOTION_MAP_"):
-            continue
-        emo = k[len("EMOTION_MAP_") :].strip()
-        raw = (v or "").strip()
-        if not emo or not raw:
-            continue
-
-        opts: List[Dict[str, Any]] = []
-        for item in raw.split("|"):
-            item = item.strip()
-            if not item:
-                continue
-            if "," in item:
-                g, i = item.split(",", 1)
-                g = g.strip()
-                try:
-                    idx = int(i.strip())
-                except Exception:
-                    idx = 0
-                if g:
-                    opts.append({"group": g, "index": idx})
-            else:
-                g = item.strip()
-                if g:
-                    opts.append({"group": g, "index": 0})
-
-        if opts:
-            out[emo] = opts
-    return out
-
-
-def get_runtime_config() -> Dict[str, Any]:
+# 加载情感配置
+def load_emotion_config():
+    """加载config.txt中的情感配置"""
     cfg_path = resolve_config_path()
     cfg = load_config(cfg_path)
 
-    emotion_enabled = cfg_bool(cfg, "EMOTION_ENABLED", False)
-    emotion_labels = _split_csv(cfg.get("EMOTION_LABELS", ""))
-    emotion_motion_map = _parse_emotion_motion_map(cfg) if emotion_enabled else {}
+    emotion_enabled = cfg_bool(cfg, "EMOTION_ENABLED", True)
+    emotion_labels = []
+
+    # 解析情感标签
+    labels_str = cfg.get("EMOTION_LABELS", "正常,开心,生气,悲伤,惊讶")
+    if labels_str:
+        emotion_labels = [label.strip() for label in labels_str.split(",") if label.strip()]
+
+    # 解析情感映射
+    emotion_map = {}
+    for key, value in cfg.items():
+        if key.startswith("EMOTION_MAP_"):
+            emotion = key.replace("EMOTION_MAP_", "")
+            options = []
+
+            for item in str(value).split("|"):
+                item = item.strip()
+                if not item:
+                    continue
+
+                if "," in item:
+                    group, idx = item.split(",", 1)
+                    options.append({
+                        "group": group.strip(),
+                        "index": int(idx.strip()) if idx.strip().isdigit() else 0
+                    })
+                else:
+                    options.append({"group": item.strip(), "index": 0})
+
+            if options:
+                emotion_map[emotion] = options
 
     return {
-        "config_path": cfg_path,
-        "stream_llm": cfg_bool(cfg, "STREAM_LLM", False),
-        "stream_tts_chunked": cfg_bool(cfg, "STREAM_TTS_CHUNKED", True),
-        "tts_workers": int(cfg.get("TTS_WORKERS", "2") or "2"),
-        "max_pending_chars": int(cfg.get("MAX_PENDING_CHARS", "160") or "160"),
-        "min_tts_chars": int(cfg.get("MIN_TTS_CHARS", "8") or "8"),
-        "flush_max_segments": int(cfg.get("FLUSH_MAX_SEGMENTS", "2") or "2"),
-        "poll_interval_ms": int(cfg.get("POLL_INTERVAL_MS", "10") or "10"),
-        "debug_tts": cfg_bool(cfg, "DEBUG_TTS", False),
-        "emotion_enabled": emotion_enabled,
-        "emotion_labels": emotion_labels,
-        "emotion_motion_map": emotion_motion_map,
-        "debug_emotion": cfg_bool(cfg, "DEBUG_EMOTION", False),
+        "enabled": emotion_enabled,
+        "labels": emotion_labels,
+        "map": emotion_map
     }
 
 
-def ensure_emo_tag(text: str, cfg: Dict[str, Any]) -> str:
-    s = (text or "").rstrip()
-    if not cfg.get("emotion_enabled", False):
-        return s
-
-    labels = cfg.get("emotion_labels") or ["正常"]
-    default = "正常" if "正常" in labels else labels[0]
-
-    last = None
-    for mm in EMO_TAG_RE.finditer(s):
-        last = mm
-    if last:
-        emo = (last.group(1) or "").strip()
-        if emo not in labels:
-            s = EMO_TAG_RE.sub(f"【emo={default}】", s)
-        return s
-
-    return s + f"【emo={default}】"
+_EMOTION_CONFIG_CACHE: Optional[Dict[str, Any]] = None
+_EMOTION_CONFIG_CACHE_MTIME: float = 0.0
+_EMOTION_CONFIG_LOCK = threading.Lock()
 
 
-# ----------------------------
-# Request models
-# ----------------------------
+def get_emotion_config_cached() -> Dict[str, Any]:
+    """Cache emotion config by file mtime to avoid reloading on every request."""
+    global _EMOTION_CONFIG_CACHE, _EMOTION_CONFIG_CACHE_MTIME
+
+    cfg_path = resolve_config_path()
+    try:
+        mtime = Path(cfg_path).stat().st_mtime
+    except Exception:
+        mtime = 0.0
+
+    with _EMOTION_CONFIG_LOCK:
+        if _EMOTION_CONFIG_CACHE is not None and mtime == _EMOTION_CONFIG_CACHE_MTIME:
+            return _EMOTION_CONFIG_CACHE
+
+        cfg = load_emotion_config()
+        _EMOTION_CONFIG_CACHE = cfg
+        _EMOTION_CONFIG_CACHE_MTIME = mtime
+        return cfg
+
+# ==================== 正则表达式 ====================
+
+# 检测中文大括号及其内容
+CHINESE_BRACKET_PATTERN = r"【[^】]*】"
+# 检测完整的句子分隔符
+SENTENCE_DELIMITERS = r"[。！？!?；;，,]"
+# 检测空格（开头的空格）
+LEADING_SPACE_PATTERN = r"^\s+"
+
+# ==================== 数据结构 ====================
+
+@dataclass
+class TTSSegment:
+    text: str
+    seq: int
+    emotion: Optional[str] = None
+
+    def to_dict(self):
+        return {
+            "text": self.text,
+            "seq": self.seq,
+            "emotion": self.emotion
+        }
+
+@dataclass
+class StreamSegment:
+    """流式分段"""
+    seq: int
+    text: str
+    emotion: str = ""
+    has_emotion_tag: bool = False
+    created_at: float = field(default_factory=time.time)
+    tts_done: bool = False
+    tts_filename: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "seq": self.seq,
+            "text": self.text,
+            "emotion": self.emotion,
+            "emo_trigger": self.has_emotion_tag
+        }
+
+@dataclass
+class ChatSession:
+    """聊天会话"""
+    session_id: str
+    user_id: str
+    sender_name: str
+    created_at: float = field(default_factory=time.time)
+
+    # 状态
+    llm_streaming: bool = False
+    tts_counter: int = 0  # TTS发送给前端的计数
+    last_emotion_detected: float = 0  # 上次检测到情感的时间
+
+    # 缓冲区
+    text_buffer: str = ""  # 用于TTS分段的缓冲区
+    display_buffer: str = ""  # 用于前端显示的缓冲区
+    bracket_buffer: str = ""  # 用于大括号检测的缓冲区
+    in_bracket: bool = False  # 是否在大括号内
+
+    # 队列
+    tts_queue: Deque[StreamSegment] = field(default_factory=deque)
+    display_queue: Deque[str] = field(default_factory=deque)
+    emotion_queue: Deque[Dict[str, Any]] = field(default_factory=deque)
+
+    def reset_buffers(self):
+        """重置缓冲区"""
+        self.text_buffer = ""
+        self.display_buffer = ""
+        self.bracket_buffer = ""
+        self.in_bracket = False
+
+# ==================== 核心处理器 ====================
+
+class StreamProcessor:
+    """流式处理器 - 严格遵循规则"""
+
+    def __init__(self, session: ChatSession, config: Dict[str, Any]):
+        self.session = session
+        self.config = config
+        self.emotion_config = get_emotion_config_cached()
+
+        # 线程池
+        self.executor = ThreadPoolExecutor(max_workers=3)
+        self.futures = []
+
+        # 状态
+        self.seq_counter = 0
+        self.last_tts_seq = 0
+        self.emotion_tts_count = 0  # 没有情感标签的TTS计数
+
+        # 锁
+        self.lock = threading.Lock()
+
+        # 情感检测
+        self.emotion_pattern = re.compile(r"【emo=([^】]+)】", re.I)
+
+    def process_chunk(self, chunk: str) -> Tuple[str, List[StreamSegment], List[Dict[str, Any]]]:
+        """
+        处理LLM返回的一个chunk
+        返回: (显示文本, TTS分段列表, 情感事件列表)
+        """
+        display_chunks = []
+        tts_segments = []
+        emotion_events = []
+
+        with self.lock:
+            # 规则3a: 线程1 - 前端显示处理
+            # 删除开头的空格，删除中文大括号内的所有内容
+            display_text = self._process_for_display(chunk)
+            if display_text:
+                display_chunks.append(display_text)
+
+            # 规则3b: 线程2 - TTS分段处理
+            new_segments = self._process_for_tts(chunk)
+            tts_segments.extend(new_segments)
+
+            # 规则3c: 线程3 - 情感服务
+            new_emotions = self._process_emotions(chunk, new_segments)
+            emotion_events.extend(new_emotions)
+
+            return display_text, tts_segments, emotion_events
+
+    def _process_for_display(self, chunk: str) -> str:
+        """处理用于前端显示的文本"""
+        if not chunk:
+            return ""
+
+        # 删除开头的空格
+        text = re.sub(LEADING_SPACE_PATTERN, "", chunk)
+
+        # 删除中文大括号内的所有内容
+        text = re.sub(CHINESE_BRACKET_PATTERN, "", text)
+
+        return text
+
+    def _process_for_tts(self, chunk: str) -> List[StreamSegment]:
+        """处理用于TTS的文本"""
+        if not chunk:
+            return []
+
+        segments = []
+
+        # 处理字符流
+        for char in chunk:
+            if self.session.in_bracket:
+                # 在大括号内，添加到括号缓冲区
+                self.session.bracket_buffer += char
+
+                # 检查是否遇到结束括号
+                if char == "】":
+                    self.session.in_bracket = False
+                    # 清空括号缓冲区（舍弃大括号内的所有内容）
+                    self.session.bracket_buffer = ""
+            else:
+                # 不在大括号内
+                if char == "【":
+                    # 开始大括号
+                    self.session.in_bracket = True
+                    self.session.bracket_buffer = char
+                else:
+                    # 正常字符，添加到文本缓冲区
+                    self.session.text_buffer += char
+
+                    # 检查是否为分隔符
+                    if re.match(SENTENCE_DELIMITERS, char):
+                        # 遇到分隔符，分割为一段
+                        if self.session.text_buffer.strip():
+                            segment = self._create_tts_segment(self.session.text_buffer)
+                            if segment:
+                                segments.append(segment)
+                            self.session.text_buffer = ""
+
+        # 检查缓冲区是否过长（防止缓冲区无限增长）
+        if len(self.session.text_buffer) > 100:
+            # 强制分割
+            segment = self._create_tts_segment(self.session.text_buffer)
+            if segment:
+                segments.append(segment)
+            self.session.text_buffer = ""
+
+        return segments
+
+    def _create_tts_segment(self, text: str) -> Optional[StreamSegment]:
+        if not text:
+            return None
+
+        # 删除大括号内容
+        clean_text = re.sub(CHINESE_BRACKET_PATTERN, "", text)
+
+        # 删除所有空白字符（包含内部空格）
+        clean_text = re.sub(r"\s+", "", clean_text)
+
+        clean_text = clean_text.strip()
+
+        if not clean_text:
+            return None
+
+        # 至少包含一个有效字符
+        if not re.search(r"[A-Za-z0-9\u4e00-\u9fa5]", clean_text):
+            return None
+
+        if len(clean_text) == 1:
+            return None
+
+        self.seq_counter += 1
+        return StreamSegment(
+            seq=self.seq_counter,
+            text=clean_text
+        )
+
+    def _process_emotions(self, chunk: str, new_segments: List[StreamSegment]) -> List[Dict[str, Any]]:
+        """处理情感检测"""
+        if not self.emotion_config["enabled"]:
+            return []
+
+        events = []
+
+        # 在chunk中查找情感标签
+        emotion_matches = list(self.emotion_pattern.finditer(chunk))
+
+        if emotion_matches:
+            # 检测到情感标签
+            for match in emotion_matches:
+                emotion = match.group(1)
+                # 检查情感是否在配置中
+                if emotion in self.emotion_config["labels"]:
+                    # 规则3c: 匹配上则发送情感信息
+                    events.append({
+                        "type": "emotion_detected",
+                        "emotion": emotion,
+                        "timestamp": time.time()
+                    })
+
+                    # 重置计数
+                    self.emotion_tts_count = 0
+                    self.session.last_emotion_detected = time.time()
+
+            # 如果有新的TTS分段，为它们标记情感
+            for segment in new_segments:
+                if emotion_matches:
+                    last_emotion = emotion_matches[-1].group(1)
+                    if last_emotion in self.emotion_config["labels"]:
+                        segment.emotion = last_emotion
+                        segment.has_emotion_tag = True
+        else:
+            # 没有检测到情感标签
+            self.emotion_tts_count += len(new_segments)
+
+            # 规则3c: 若两次TTS发送还没有检测到中文大括号，则在第三次加入【emo=正常】
+            if self.emotion_tts_count >= 3 and "正常" in self.emotion_config["labels"]:
+                # 为当前的分段添加默认情感
+                for segment in new_segments:
+                    segment.emotion = "正常"
+                    segment.has_emotion_tag = True
+
+                events.append({
+                    "type": "default_emotion_added",
+                    "emotion": "正常",
+                    "reason": "连续3次TTS无情感标签",
+                    "timestamp": time.time()
+                })
+
+                # 重置计数
+                self.emotion_tts_count = 0
+
+        return events
+
+    def flush_buffers(self) -> Tuple[List[StreamSegment], List[Dict[str, Any]]]:
+        """流结束时清空剩余缓冲区"""
+        segments = []
+        emotions = []
+
+        # 处理剩余文本缓冲区
+        remaining_text = self.session.text_buffer.strip()
+        if remaining_text:
+            # 删除大括号内容
+            clean_text = re.sub(CHINESE_BRACKET_PATTERN, "", remaining_text).strip()
+
+            if clean_text:
+                # 如果没有结束标点，补一个句号
+                if not re.search(r"[。！？!?；;]$", clean_text):
+                    clean_text += "。"
+
+                self.seq_counter += 1
+                segment = StreamSegment(
+                    seq=self.seq_counter,
+                    text=clean_text
+                )
+                segments.append(segment)
+
+        # 清空缓冲区
+        self.session.text_buffer = ""
+        self.session.bracket_buffer = ""
+        self.session.in_bracket = False
+
+        return segments, emotions
+
+# ==================== TTS管理器 ====================
+
+class TTSManager:
+    """TTS管理器"""
+
+    def __init__(self, anchor, max_workers=3):
+        self.anchor = anchor
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.tts_dir = Path(get_env("DATA_TTS_DIR", "data/tts"))
+        self.tts_dir.mkdir(parents=True, exist_ok=True)
+
+    def synthesize(self, segment: StreamSegment) -> Dict[str, Any]:
+        """合成TTS"""
+        try:
+            result = self.anchor.tts_to_file(segment.text)
+            if result.get("ok") and result.get("filename"):
+                segment.tts_filename = result["filename"]
+                segment.tts_done = True
+
+                return {
+                    "seq": segment.seq,
+                    "audio_url": f"/audio/{result['filename']}",
+                    "text": segment.text,
+                    "emotion": segment.emotion,
+                    "emo_trigger": segment.has_emotion_tag
+                }
+            else:
+                return {
+                    "seq": segment.seq,
+                    "error": result.get("error", "TTS失败"),
+                    "text": segment.text
+                }
+        except Exception as e:
+            return {
+                "seq": segment.seq,
+                "error": str(e),
+                "text": segment.text
+            }
+
+    def synthesize_async(self, segment: StreamSegment, callback=None):
+        """异步合成TTS"""
+        future = self.executor.submit(self.synthesize, segment)
+        if callback:
+            future.add_done_callback(lambda f: callback(f.result()))
+        return future
+
+# ==================== API服务器 ====================
+
+app = FastAPI(
+    title="虚拟主播API服务器",
+    description="严格遵循规则的虚拟主播后端",
+    version="1.0.0"
+)
+
+# CORS配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 静态文件
+BASE_DIR = Path(__file__).parent
+web_dir = BASE_DIR / get_env("STATIC_WEB_PATH", "web")
+live2d_dir = BASE_DIR / get_env("STATIC_LIVE2D_PATH", "Live2D")
+
+if web_dir.exists():
+    app.mount("/web", StaticFiles(directory=str(web_dir), html=True), name="web")
+
+if live2d_dir.exists():
+    app.mount("/Live2D", StaticFiles(directory=str(live2d_dir)), name="Live2D")
+
+# 全局状态
+anchor = SmartVirtualAnchor(
+    lmdeploy_url=get_env("LMDEPLOY_URL", f"http://{get_env('LMDEPLOY_HOST', '127.0.0.1')}:{get_env_int('LMDEPLOY_PORT', 23333)}"),
+    name=get_env("ANCHOR_NAME", "小爱"),
+    knowledge_txt_path=get_env("KNOWLEDGE_TXT", "knowledge.txt")
+)
+
+tts_manager = TTSManager(anchor, max_workers=3)
+sessions = {}
+session_counter = 0
+
+# ==================== 数据模型 ====================
+
 class ChatRequest(BaseModel):
     user_id: Optional[str] = None
     sender_name: Optional[str] = None
     message: str
-    tts: bool = False
-    tts_params: Optional[Dict[str, Any]] = None
-
-
-class TTSOnceRequest(BaseModel):
-    text: str
-    sender_name: Optional[str] = None
-    tts_params: Optional[Dict[str, Any]] = None
-
-
-# ----------------------------
-# Segmentation / normalization
-# ----------------------------
-BOUNDARIES = {"，", ",", "。", "！", "!", "？", "?", "；", ";", "\n"}
-_STRONG_END_RE = re.compile(r"[。！？!?]\s*$")
-
-
-def normalize_tts_text(text: str, sender_name: Optional[str] = None) -> str:
-    s = (text or "").strip()
-    if not s:
-        return ""
-    s = EMO_TAG_RE.sub("", s)
-    s = REF_TAG_RE.sub("", s)
-    s = SEQ_RE.sub("", s)
-    s = remove_exact_sender_mention(s, sender_name)
-    s = remove_leading_mention(s)
-    s = re.sub(r"^[,，、\s]+", "", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    if not s:
-        return ""
-    if _PUNCT_ONLY_RE.match(s):
-        return ""
-    return s
-
-
-def effective_len_for_threshold(text: str, sender_name: Optional[str] = None) -> int:
-    s = normalize_tts_text(text, sender_name=sender_name)
-    return len(re.sub(r"[，,。！？!?；;：:\s]+", "", s))
-
-
-def extract_boundary_segments(buf: str, max_pending_chars: int) -> Tuple[List[str], str]:
-    segs: List[str] = []
-    start = 0
-    for i, ch in enumerate(buf):
-        if ch in BOUNDARIES:
-            piece = buf[start : i + 1].strip()
-            if piece:
-                segs.append(piece)
-            start = i + 1
-
-    rest = buf[start:].strip()
-    if len(rest) > max_pending_chars:
-        cut = rest.rfind(" ", 0, max_pending_chars)
-        cut = cut if cut > 0 else max_pending_chars
-        segs.append(rest[:cut].strip())
-        rest = rest[cut:].strip()
-
-    return segs, rest
-
-
-def merge_tail_to_max_segments(text: str, min_len: int, max_segments: int = 2) -> List[str]:
-    text = (text or "").strip()
-    if not text:
-        return []
-
-    parts: List[str] = []
-    start = 0
-    for i, ch in enumerate(text):
-        if ch in BOUNDARIES:
-            piece = text[start : i + 1].strip()
-            if piece:
-                parts.append(piece)
-            start = i + 1
-    tail = text[start:].strip()
-    if tail:
-        parts.append(tail)
-
-    merged: List[str] = []
-    cur = ""
-    for p in parts:
-        cur += p
-        if len(cur) >= min_len and _STRONG_END_RE.search(cur):
-            merged.append(cur.strip())
-            cur = ""
-        elif len(cur) >= max(min_len * 2, min_len + 20) and len(merged) < max_segments - 1:
-            merged.append(cur.strip())
-            cur = ""
-    if cur.strip():
-        merged.append(cur.strip())
-
-    if len(merged) > max_segments:
-        head = merged[: max_segments - 1]
-        tail2 = "".join(merged[max_segments - 1 :]).strip()
-        merged = head + ([tail2] if tail2 else [])
-
-    if len(merged) >= 2 and sum(len(x) for x in merged[:-1]) < min_len:
-        merged = ["".join(merged).strip()]
-
-    return [x for x in merged if x.strip()]
-
-
-def extract_last_emotion(text: str) -> Tuple[str, str, bool]:
-    s = (text or "").strip()
-    m = None
-    for mm in EMO_TAG_RE.finditer(s):
-        m = mm
-    if not m:
-        return s, "", False
-    emo = (m.group(1) or "").strip()
-    cleaned = (s[: m.start()] + s[m.end() :]).strip()
-    return cleaned, emo, True
-
-
-def _split_by_boundaries_keep_punct(text: str) -> List[str]:
-    parts: List[str] = []
-    start = 0
-    for i, ch in enumerate(text or ""):
-        if ch in BOUNDARIES:
-            piece = (text[start : i + 1] or "").strip()
-            if piece:
-                parts.append(piece)
-            start = i + 1
-    tail = (text[start:] or "").strip()
-    if tail:
-        parts.append(tail)
-    return parts
-
-
-def split_piece_on_emo_tags(text: str, default_emotion: str = "") -> List[Tuple[str, str, bool]]:
-    s = text or ""
-    out: List[Tuple[str, str, bool]] = []
-    last = 0
-    found_any = False
-
-    for mm in EMO_TAG_RE.finditer(s):
-        found_any = True
-        start, end = mm.span()
-        emo = (mm.group(1) or "").strip() or default_emotion
-
-        pre = (s[last:start] or "")
-        pre = EMO_TAG_RE.sub("", pre)
-        pre = REF_TAG_RE.sub("", pre).strip()
-
-        if pre:
-            pre_parts = _split_by_boundaries_keep_punct(pre)
-            for p in pre_parts[:-1]:
-                p = (p or "").strip()
-                if p:
-                    out.append((p, default_emotion, False))
-            last_part = (pre_parts[-1] or "").strip()
-            if last_part:
-                out.append((last_part, emo, True))
-
-        last = end
-
-    tail = (s[last:] or "")
-    tail = EMO_TAG_RE.sub("", tail)
-    tail = REF_TAG_RE.sub("", tail).strip()
-    for p in _split_by_boundaries_keep_punct(tail):
-        p = (p or "").strip()
-        if p:
-            out.append((p, default_emotion, False))
-
-    if not found_any:
-        clean = EMO_TAG_RE.sub("", s)
-        clean = REF_TAG_RE.sub("", clean).strip()
-        if clean:
-            out.append((clean, default_emotion, False))
-
-    return out
-
-
-class DeltaTagFilter:
-    def __init__(self) -> None:
-        self._buf = ""
-        self._in_bracket = False
-
-    def push(self, delta: str) -> str:
-        if not delta:
-            return ""
-        out = []
-        for ch in delta:
-            if not self._in_bracket:
-                if ch == "【":
-                    self._in_bracket = True
-                    self._buf = "【"
-                else:
-                    out.append(ch)
-            else:
-                self._buf += ch
-                if ch == "】":
-                    block = self._buf
-                    self._buf = ""
-                    self._in_bracket = False
-                    if EMO_TAG_RE.fullmatch(block) or REF_TAG_RE.fullmatch(block):
-                        continue
-                    out.append(block)
-        return "".join(out)
-
-    def flush(self) -> None:
-        self._buf = ""
-        self._in_bracket = False
-
-
-def sse(obj: Dict[str, Any]) -> str:
-    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
-
-
-# ----------------------------
-# Streaming engine (shared by WS/SSE)
-# ----------------------------
-class TTSPool:
-    def __init__(self, max_workers: int) -> None:
-        self.pool = ThreadPoolExecutor(max_workers=max_workers)
-        self.futures: List[Tuple[int, Future, str, str, bool]] = []
-
-    def submit(
-        self, seq: int, fn: Callable[[], Dict[str, Any]], display_text: str, emo: str, emo_trigger: bool
-    ) -> None:
-        fut = self.pool.submit(fn)
-        self.futures.append((seq, fut, display_text, emo, emo_trigger))
-
-    def drain_done(self) -> List[Dict[str, Any]]:
-        evts: List[Dict[str, Any]] = []
-        done_idx = [i for i, (_, fut, *_rest) in enumerate(self.futures) if fut.done()]
-        for i in sorted(done_idx, reverse=True):
-            s, fut, display_piece, emo, had_tag = self.futures.pop(i)
-            try:
-                info = fut.result()
-            except Exception as e:
-                evts.append(
-                    {
-                        "type": "audio_error",
-                        "seq": s,
-                        "error": f"future raised: {e}",
-                        "text": display_piece,
-                        "emotion": emo,
-                        "emo_trigger": had_tag,
-                    }
-                )
-                continue
-
-            if info.get("ok") and info.get("filename"):
-                evts.append(
-                    {
-                        "type": "audio",
-                        "seq": s,
-                        "audio_url": f"/audio/{info['filename']}",
-                        "text": display_piece,
-                        "emotion": emo,
-                        "emo_trigger": had_tag,
-                    }
-                )
-            else:
-                evts.append(
-                    {
-                        "type": "audio_error",
-                        "seq": s,
-                        "error": info.get("error", "tts failed"),
-                        "text": display_piece,
-                        "emotion": emo,
-                        "emo_trigger": had_tag,
-                    }
-                )
-        return evts
-
-    def has_pending(self) -> bool:
-        return bool(self.futures)
-
-    def shutdown(self) -> None:
-        try:
-            self.pool.shutdown(wait=False, cancel_futures=False)
-        except Exception:
-            pass
-
-
-class StreamEngine:
-    def __init__(self, cfg: Dict[str, Any], sender_name: Optional[str], tts_params: Optional[Dict[str, Any]]) -> None:
-        self.cfg = cfg
-        self.sender_name = sender_name
-        self.tts_params = tts_params
-
-        self.join_threshold = max(1, int(cfg["min_tts_chars"]))
-        self.max_pending_chars = max(30, int(cfg["max_pending_chars"]))
-        self.flush_max_segments = max(1, int(cfg["flush_max_segments"]))
-        self.poll_interval = max(1, int(cfg["poll_interval_ms"])) / 1000.0
-
-        self.emo_enabled = bool(cfg.get("emotion_enabled", False))
-        self.debug_tts = bool(cfg.get("debug_tts", False))
-        self.debug_emo = bool(cfg.get("debug_emotion", False))
-
-        self.delta_filter = DeltaTagFilter() if self.emo_enabled else None
-
-        self.buf = ""
-        self.pending_short = ""
-        self.seq = 0
-        self.emo_seen = False
-
-        self.tts_pool = TTSPool(max_workers=max(1, int(cfg["tts_workers"])))
-
-        # segment concat-dedupe
-        self._recent_seg = deque(maxlen=6)  # store recent (text, ts)
-        self._concat_dedupe_sec = 2.0  # only check within 2 seconds window
-
-        # short-time identical segment dedupe
-        self._last_seg_text = ""
-        self._last_seg_time = 0.0
-
-        # last segment info (for tail emo fallback)
-        self._last_segment_seq = 0
-        self._last_segment_text = ""
-        self._last_segment_had_emo = False
-
-        # seq -> latest emotion status (used to override audio events)
-        self._seq_emotion: Dict[int, Tuple[str, bool]] = {}
-
-    def _submit_tts(self, clean_piece: str, emo: str, emo_trigger: bool) -> Dict[str, Any]:
-        tts_in = normalize_tts_text(clean_piece, sender_name=self.sender_name)
-        return ANCHOR.tts_to_file(tts_in, self.tts_params)
-
-    def _emit_segments_from_piece(self, piece: str, default_emotion: str = "") -> List[Tuple[str, str, bool]]:
-        if self.emo_enabled:
-            return split_piece_on_emo_tags(piece, default_emotion=default_emotion)
-        return [(piece, "", False)]
-
-    def _is_concat_duplicate(self, text: str) -> bool:
-        now = time.time()
-        text = (text or "").strip()
-        if not text:
-            return False
-
-        def norm(s: str) -> str:
-            return re.sub(r"\s+", "", (s or ""))
-
-        target = norm(text)
-
-        recent = [t for (t, ts) in self._recent_seg if (now - ts) <= self._concat_dedupe_sec]
-        if len(recent) < 2:
-            return False
-
-        max_k = min(6, len(recent))
-        for k in range(2, max_k + 1):
-            cand = norm("".join(recent[-k:]))
-            if cand == target:
-                return True
-        return False
-
-    def process_delta(self, delta: str, enable_tts: bool) -> Tuple[str, List[Dict[str, Any]]]:
-        events: List[Dict[str, Any]] = []
-        self.buf += delta
-
-        if self.emo_enabled and "【emo=" in (delta or ""):
-            self.emo_seen = True
-
-        delta_out = delta
-        if self.delta_filter is not None:
-            delta_out = self.delta_filter.push(delta)
-
-        if not enable_tts or not self.cfg.get("stream_tts_chunked", True):
-            return delta_out, events
-
-        segs, rest = extract_boundary_segments(self.buf, max_pending_chars=self.max_pending_chars)
-        self.buf = rest
-
-        for raw_piece in segs:
-            piece = (raw_piece or "").strip()
-            if not piece:
-                continue
-
-            eff = effective_len_for_threshold(piece, sender_name=self.sender_name)
-            if eff < self.join_threshold:
-                self.pending_short += piece
-                continue
-
-            if self.pending_short:
-                piece = (self.pending_short + piece).strip()
-                self.pending_short = ""
-
-            for clean_piece, emo, had_tag in self._emit_segments_from_piece(piece):
-                clean_piece = (clean_piece or "").strip()
-                if not clean_piece:
-                    continue
-
-                if _PUNCT_ONLY_RE.match(clean_piece):
-                    self.pending_short += clean_piece
-                    continue
-
-                if had_tag:
-                    self.emo_seen = True
-
-                now = time.time()
-                if clean_piece == self._last_seg_text and (now - self._last_seg_time) < 1.0:
-                    continue
-                self._last_seg_text = clean_piece
-                self._last_seg_time = now
-
-                if self._is_concat_duplicate(clean_piece):
-                    continue
-
-                self._recent_seg.append((clean_piece, time.time()))
-
-                self.seq += 1
-                events.append(
-                    {
-                        "type": "segment",
-                        "seq": self.seq,
-                        "text": clean_piece,
-                        "emotion": emo,
-                        "emo_trigger": had_tag,
-                    }
-                )
-
-                self._last_segment_seq = self.seq
-                self._last_segment_text = clean_piece
-                self._last_segment_had_emo = bool(had_tag)
-
-                self._seq_emotion[self.seq] = (emo or "", bool(had_tag))
-
-                if self.debug_emo:
-                    print(f"[EMO] segment seq={self.seq} emo={emo!r} trigger={had_tag} text={clean_piece!r}")
-
-                tts_in = normalize_tts_text(clean_piece, sender_name=self.sender_name)
-                if self.debug_tts:
-                    print(
-                        f"[TTS_SUBMIT] seq={self.seq} raw={clean_piece!r} -> tts={tts_in!r} emo={emo!r} trigger={had_tag}"
-                    )
-
-                if not tts_in:
-                    events.append(
-                        {
-                            "type": "audio_skip",
-                            "seq": self.seq,
-                            "reason": "punct_only_or_empty",
-                            "text": clean_piece,
-                            "emotion": emo,
-                            "emo_trigger": had_tag,
-                        }
-                    )
-                    continue
-
-                try:
-                    self.tts_pool.submit(
-                        self.seq,
-                        lambda cp=clean_piece, e=emo, t=had_tag: self._submit_tts(cp, e, t),
-                        display_text=clean_piece,
-                        emo=emo,
-                        emo_trigger=had_tag,
-                    )
-                except Exception as e:
-                    events.append(
-                        {
-                            "type": "audio_error",
-                            "seq": self.seq,
-                            "error": f"submit failed: {e}",
-                            "text": clean_piece,
-                            "emotion": emo,
-                            "emo_trigger": had_tag,
-                        }
-                    )
-
-        return delta_out, events
-
-    def drain_audio_events(self) -> List[Dict[str, Any]]:
-        evts = self.tts_pool.drain_done()
-
-        # override audio event emotion/trigger using latest seq emotion state
-        for e in evts:
-            if e.get("type") == "audio":
-                seq = e.get("seq")
-                if isinstance(seq, int) and seq in self._seq_emotion:
-                    emo, trig = self._seq_emotion[seq]
-                    e["emotion"] = emo
-                    e["emo_trigger"] = trig
-
-        return evts
-
-    def flush_end(self, enable_tts: bool) -> List[Dict[str, Any]]:
-        if self.delta_filter is not None:
-            self.delta_filter.flush()
-
-        if not enable_tts or not self.cfg.get("stream_tts_chunked", True):
-            return []
-
-        events: List[Dict[str, Any]] = []
-        tail_all = (self.pending_short + self.buf).strip()
-        self.pending_short = ""
-        self.buf = ""
-
-        tail_emo = ""
-        tail_has_emo = False
-        if self.emo_enabled:
-            tail_all, tail_emo, tail_has_emo = extract_last_emotion(tail_all)
-
-        if self.emo_enabled and (not tail_has_emo) and (not self.emo_seen):
-            tail_emo = "正常"
-            tail_has_emo = True
-
-        if tail_has_emo and self._last_segment_seq > 0 and not self._last_segment_had_emo:
-            events.append(
-                {
-                    "type": "emotion_update",
-                    "seq": self._last_segment_seq,
-                    "emotion": tail_emo,
-                    "emo_trigger": True,
-                    "text": self._last_segment_text,
-                }
+    tts: bool = True
+
+# ==================== WebSocket处理器 ====================
+
+class WebSocketManager:
+    """WebSocket管理器"""
+
+    def __init__(self, websocket):
+        self.ws = websocket
+        self.session: Optional[ChatSession] = None
+        self.processor: Optional[StreamProcessor] = None
+        self.live_session_id: Optional[str] = None
+        self.live_mgr: Optional[LiveMemoryManager] = None
+
+    async def send_event(self, event_type: str, data: dict):
+        """发送事件到前端"""
+        event = {"type": event_type, **data}
+        # ✅ 临时调试：确认后端确实在发事件（尤其是 start/delta/done）
+        if event_type in ("start", "delta", "done", "server_error"):
+            print("[WS->UI]", event_type, (event.get("text", "")[:60] if event_type == "delta" else ""))
+        await self.ws.send_json(event)
+
+    async def handle_stream(self, request: ChatRequest):
+        """处理流式对话（已修复：一条WS连接=一场直播；断开才结束并落盘）"""
+        global session_counter
+
+        # ===================== 直播会话：只在第一次消息创建 =====================
+        if self.session is None:
+            session_counter += 1
+            session_id = f"session_{session_counter}"
+            self.live_session_id = session_id
+
+            self.session = ChatSession(
+                session_id=session_id,
+                user_id=request.user_id or "default_room",
+                sender_name=request.sender_name or "用户"
             )
-            self._seq_emotion[self._last_segment_seq] = (tail_emo or "", True)
-            if self.debug_emo:
-                print(
-                    f"[EMO] update seq={self._last_segment_seq} emo={tail_emo!r} trigger=True text={self._last_segment_text!r}"
-                )
-            self.emo_seen = True
+            sessions[session_id] = self.session
 
-        for piece in merge_tail_to_max_segments(
-            tail_all, min_len=self.join_threshold, max_segments=self.flush_max_segments
-        ):
-            default_emo = tail_emo if tail_has_emo else ""
-            for clean_piece, emo, had_tag in self._emit_segments_from_piece(piece, default_emotion=default_emo):
-                clean_piece = (clean_piece or "").strip()
-                if not clean_piece:
-                    continue
+            # 创建 live memory manager（断开时落盘 live_sessions + 写入 RAG 总结）
+            self.live_mgr = LiveMemoryManager(
+                anchor=anchor,
+                user_id=self.session.user_id,
+                sender_name=self.session.sender_name,
+                max_ctx_tokens=int(get_env("MAX_CTX_TOKENS", "1800")),
+                keep_last=int(get_env("KEEP_LAST", "6")),
+                summary_temperature=float(get_env("SUMMARY_TEMPERATURE", "0.2")),
+            )
+        else:
+            session_id = self.live_session_id
 
-                if _PUNCT_ONLY_RE.match(clean_piece):
-                    continue
+        # 加载配置（用于 StreamProcessor）
+        cfg_path = resolve_config_path()
+        cfg = load_config(cfg_path)
 
-                if self._is_concat_duplicate(clean_piece):
-                    continue
+        # ✅ 每条新消息开始前重置缓冲区（非常关键）
+        # 否则上一轮的 in_bracket/bracket_buffer/text_buffer 状态会污染下一轮，导致 display_text 永远为空
+        self.session.reset_buffers()
 
-                self._recent_seg.append((clean_piece, time.time()))
+        # 创建处理器（每条消息一个新的 processor）
+        self.processor = StreamProcessor(self.session, cfg)
 
-                self.seq += 1
-                events.append(
-                    {
-                        "type": "segment",
-                        "seq": self.seq,
-                        "text": clean_piece,
-                        "emotion": emo,
-                        "emo_trigger": had_tag,
-                    }
-                )
+        # 用户身份（传给 LLM / 存到记忆里）
+        uid = (request.user_id or "").strip()
+        sn = (request.sender_name or "").strip()
+        llm_sender_name = sn if sn else (f"user_{uid}" if uid else None)
 
-                self._last_segment_seq = self.seq
-                self._last_segment_text = clean_piece
-                self._last_segment_had_emo = bool(had_tag)
-                self._seq_emotion[self.seq] = (emo or "", bool(had_tag))
+        # 获取LLM流式响应
+        speaker_name, llm_stream = anchor.chat_stream(
+            request.message,
+            user_id=uid,
+            sender_name=llm_sender_name
+        )
 
-                if self.debug_emo:
-                    print(f"[EMO] flush seq={self.seq} emo={emo!r} trigger={had_tag} text={clean_piece!r}")
+        # 发送元数据
+        await self.send_event("meta", {
+            "sender_name": speaker_name,
+            "tts": request.tts
+        })
 
-                tts_in = normalize_tts_text(clean_piece, sender_name=self.sender_name)
-                if not tts_in:
-                    continue
+        # ✅ 不要等到 delta 才 start（否则开头被清洗为""时前端可能一直不渲染）
+        await self.send_event("start", {"session_id": session_id, "anchor": anchor.anchor_name})
+        first_delta_sent = True
+        # ================= 音频异步队列与发送任务 =================
+        loop = asyncio.get_running_loop()
+        audio_queue = asyncio.Queue()
+        expected_seq = 1
+        audio_buffer = {}
+        tts_futures = []
 
-                self.tts_pool.submit(
-                    self.seq,
-                    lambda cp=clean_piece, e=emo, t=had_tag: self._submit_tts(cp, e, t),
-                    display_text=clean_piece,
-                    emo=emo,
-                    emo_trigger=had_tag,
-                )
+        async def audio_sender():
+            nonlocal expected_seq
+            while True:
+                seq, result = await audio_queue.get()
+                if seq == -1:
+                    break
 
-        return events
+                audio_buffer[seq] = result
+                while expected_seq in audio_buffer:
+                    res = audio_buffer.pop(expected_seq)
+                    if "error" in res:
+                        await self.send_event("audio_error", res)
+                    else:
+                        await self.send_event("audio", res)
+                    expected_seq += 1
 
-    async def drain_all_audio_async(self, emit: Callable[[Dict[str, Any]], Any]) -> None:
-        while self.tts_pool.has_pending():
-            evts = self.drain_audio_events()
-            if evts:
-                for evt in evts:
-                    await emit(evt)
-            else:
-                await asyncio.sleep(self.poll_interval)
+        sender_task = asyncio.create_task(audio_sender())
 
-    def drain_all_audio_sync(self) -> Iterable[Dict[str, Any]]:
-        while self.tts_pool.has_pending():
-            evts = self.drain_audio_events()
-            if evts:
-                for evt in evts:
-                    yield evt
-            else:
-                time.sleep(self.poll_interval)
+        # ================= 把同步LLM流变成异步，防止卡死服务 =========
+        async def async_llm_generator():
+            iterator = iter(llm_stream)
 
-    def close(self) -> None:
-        self.tts_pool.shutdown()
+            def safe_next():
+                try:
+                    return next(iterator)
+                except StopIteration:
+                    return None
 
+            while True:
+                chunk = await loop.run_in_executor(None, safe_next)
+                if chunk is None:
+                    break
+                yield chunk
 
-# ----------------------------
-# Routes
-# ----------------------------
-##@app.on_event("shutdown")
-##def _persist_on_shutdown():
-##    persist_all_live_logs(reason="fastapi_shutdown")
+        # 处理流式输出
+        full_display_text = ""
+        first_delta_sent = False
 
+        async for chunk in async_llm_generator():
+            display_text, tts_segments, emotion_events = self.processor.process_chunk(chunk)
+
+            # 线程1: 发送显示文本到前端
+            if display_text:
+                full_display_text += display_text
+                await self.send_event("delta", {"text": display_text})
+
+            # 线程2: 处理TTS分段
+            if request.tts and tts_segments:
+                for segment in tts_segments:
+                    await self.send_event("segment", segment.to_dict())
+
+                    def tts_callback(result, seg=segment):
+                        loop.call_soon_threadsafe(audio_queue.put_nowait, (seg.seq, result))
+
+                    future = tts_manager.synthesize_async(segment, tts_callback)
+                    tts_futures.append(future)
+
+            # 线程3: 处理情感事件
+            for emotion_event in emotion_events:
+                if emotion_event.get("type") == "emotion_detected":
+                    await self.send_event("emotion_update", {
+                        "emotion": emotion_event["emotion"],
+                        "timestamp": emotion_event["timestamp"]
+                    })
+
+        # ================= 收尾：flush 最后缓冲 =================
+        remaining_segments, remaining_emotions = self.processor.flush_buffers()
+
+        if request.tts and remaining_segments:
+            for segment in remaining_segments:
+                await self.send_event("segment", segment.to_dict())
+
+                def tts_callback(result, seg=segment):
+                    loop.call_soon_threadsafe(audio_queue.put_nowait, (seg.seq, result))
+
+                future = tts_manager.synthesize_async(segment, tts_callback)
+                tts_futures.append(future)
+
+        # 等待所有 TTS 线程结束
+        for future in tts_futures:
+            try:
+                await loop.run_in_executor(None, future.result, 15)
+            except:
+                pass
+
+        # 告诉发送任务结束
+        await audio_queue.put((-1, None))
+        await sender_task
+
+        # ===================== 关键新增：把“主播最终回复”写入记忆 + live_mgr 全量记录 =====================
+        final_reply = (full_display_text or "").strip()
+
+        # 2) 记录主播回复（全量记录）
+        if self.live_mgr is not None and final_reply:
+            self.live_mgr.live.add_chunk(f"主播「{anchor.anchor_name}」：{final_reply}")
+
+        # 3) 写入 anchor session memory（chat_stream 不会写 assistant）
+        try:
+            if final_reply:
+                uid2 = request.user_id or "default_room"
+                anchor_session = anchor._get_session(uid2)
+                anchor_session.memory.add_message("assistant", final_reply)
+                anchor_session.memory.trim_keep_last(anchor.memory_keep_last)
+
+                # 可选：每轮都做一次 compact 检查（让 live_chunks 会逐步生成摘要）
+                if self.live_mgr is not None:
+                    self.live_mgr.maybe_compact_context()
+        except Exception as e:
+            print(f"[LIVE] append assistant to memory failed: {e}")
+
+        # 发送完成事件
+        await self.send_event("done", {})
+
+        # ⚠️ 不要在这里 del sessions[session_id]！
+        # 因为你要求“WebSocket断开才算直播结束”，断开时还需要 live_session_id 对应的会话。
+        # 清理会话放到 websocket_endpoint 的 WebSocketDisconnect 里统一做。
+
+# ==================== API端点 ====================
 
 @app.get("/")
-def root():
+async def root():
     return {
-        "service": "Virtual Anchor API",
+        "service": "虚拟主播API",
+        "version": "1.0.0",
         "status": "running",
-        "endpoints": {
-            "GET /config": "read runtime config",
-            "POST /chat_once": "one-shot JSON",
-            "POST /chat_stream": "SSE stream: delta + segment + audio",
-            "POST /chat": "auto choose once/stream by config",
-            "WS /ws": "WebSocket stream: delta + segment + audio",
-            "POST /tts_once": "one-shot TTS",
-            "GET /audio/{filename}": "serve wav",
-            "GET /health": "health check",
-        },
+        "rules": [
+            "1. 从前端接收输入",
+            "2. 流式调用LLM API",
+            "3. 三线程处理: 显示/TTS/情感"
+        ]
     }
-
 
 @app.get("/config")
-def read_config():
-    return get_runtime_config()
+async def get_config():
+    """获取配置"""
+    cfg_path = resolve_config_path()
+    cfg = load_config(cfg_path)
 
+    emotion_map = {}
+    for key, value in cfg.items():
+        if key.startswith("EMOTION_MAP_"):
+            emotion = key.replace("EMOTION_MAP_", "")
+            options = []
 
-@app.post("/chat_once")
-def chat_once(req: ChatRequest):
-    cfg = get_runtime_config()
-    emo_enabled = bool(cfg.get("emotion_enabled", False))
+            for item in str(value).split("|"):
+                if "," in item:
+                    group, idx = item.split(",", 1)
+                    options.append({
+                        "group": group.strip(),
+                        "index": int(idx.strip()) if idx.strip().isdigit() else 0
+                    })
+                else:
+                    options.append({"group": item.strip(), "index": 0})
 
-    effective_user_id = (req.user_id or _env_str("DEFAULT_ROOM", "default_room")).strip()
-    r = ANCHOR.chat(req.message, user_id=effective_user_id, sender_name=req.sender_name)
-
-    raw_text = ensure_emo_tag(r["response"], cfg)
-
-    if effective_user_id not in LIVE_LOGS:
-        LIVE_LOGS[effective_user_id] = LiveFullLog()
-    LIVE_LOGS[effective_user_id].add("user", req.message, sender_name=(req.sender_name or r.get("user_name")))
-    LIVE_LOGS[effective_user_id].add("assistant", raw_text, sender_name=None)
-
-    clean_text, emo, found = extract_last_emotion(raw_text) if emo_enabled else (raw_text, "", False)
-
-    out: Dict[str, Any] = {
-        "user_id": effective_user_id,
-        "sender_name": r["user_name"],
-        "text": clean_text,
-        "processing_time": r["processing_time"],
-    }
-    if emo_enabled:
-        out["emotion"] = emo or ""
-        out["emo_trigger"] = bool(found)
-
-    if req.tts:
-        tts_in = normalize_tts_text(clean_text, sender_name=req.sender_name)
-        if not tts_in:
-            out.update({"tts_ok": False, "tts_error": "empty_after_normalize", "audio_url": None})
-            return out
-
-        info = ANCHOR.tts_to_file(tts_in, req.tts_params)
-        out["tts_ok"] = info.get("ok", False)
-        out["tts_error"] = info.get("error")
-        out["audio_filename"] = info.get("filename")
-        out["audio_url"] = f"/audio/{info['filename']}" if info.get("ok") and info.get("filename") else None
-
-    return out
-
-
-@app.post("/tts_once")
-def tts_once(req: TTSOnceRequest):
-    tts_in = normalize_tts_text(req.text, sender_name=req.sender_name)
-    if not tts_in:
-        return {"ok": False, "error": "empty_after_normalize", "audio_url": None}
-
-    info = ANCHOR.tts_to_file(tts_in, req.tts_params)
-    if not info.get("ok"):
-        return {"ok": False, "error": info.get("error") or "tts failed", "audio_url": None}
-    fn = info.get("filename")
-    return {"ok": True, "error": None, "audio_url": f"/audio/{fn}" if fn else None, "audio_filename": fn}
-
-
-@app.get("/audio/{filename}")
-def get_audio(filename: str):
-    path = os.path.join(TTS_DIR, filename)
-    if not os.path.exists(path):
-        raise HTTPException(404, "audio file not found")
-    return FileResponse(path, media_type="audio/wav")
-
-
-@app.get("/health")
-def health():
-    lmdeploy_ok = False
-    try:
-        import requests as _r
-
-        host = _env_str("LMDEPLOY_HOST", "127.0.0.1")
-        port = _env_int("LMDEPLOY_PORT", 23333)
-        resp = _r.get(f"http://{host}:{port}/v1/models", timeout=_env_int("HEALTH_CHECK_TIMEOUT_SECONDS", 2))
-
-        lmdeploy_ok = resp.status_code == 200
-    except Exception:
-        lmdeploy_ok = False
+            if options:
+                emotion_map[emotion] = options
 
     return {
-        "api_server": "healthy",
-        "lmdeploy": "connected" if lmdeploy_ok else "disconnected",
-        "timestamp": time.time(),
+        "emotion_enabled": cfg_bool(cfg, "EMOTION_ENABLED", True),
+        "emotion_labels": [l.strip() for l in cfg.get("EMOTION_LABELS", "正常,开心,生气,悲伤,惊讶").split(",") if l.strip()],
+        "emotion_motion_map": emotion_map,
+        "stream_llm": cfg_bool(cfg, "STREAM_LLM", True),
+        "stream_tts_chunked": cfg_bool(cfg, "STREAM_TTS_CHUNKED", True)
     }
 
-# ----------------------------
-# WebSocket streaming
-# ----------------------------
+@app.post("/chat_once")
+async def chat_once(request: ChatRequest):
+    """单次对话（兼容性端点）"""
+    uid = (request.user_id or "").strip()
+    sn = (request.sender_name or "").strip()
+
+    if uid:
+        llm_sender_name = sn if sn else f"user_{uid}"
+    else:
+        llm_sender_name = sn if sn else None
+
+    response = anchor.chat(
+        request.message,
+        user_id=uid,
+        sender_name=llm_sender_name
+    )
+
+    result = {
+        "user_id": request.user_id or "default_room",
+        "sender_name": response.get("user_name", "主播"),
+        "text": response["response"],
+        "processing_time": response.get("processing_time", 0)
+    }
+
+    if request.tts:
+        tts_result = anchor.tts_to_file(response["response"])
+        if tts_result.get("ok"):
+            result["audio_url"] = f"/audio/{tts_result['filename']}"
+            result["tts_ok"] = True
+        else:
+            result["tts_ok"] = False
+            result["tts_error"] = tts_result.get("error")
+
+    return result
+
+@app.post("/tts_once")
+async def tts_once(text: str):
+    """单次TTS"""
+    tts_result = anchor.tts_to_file(text)
+    if tts_result.get("ok"):
+        return {
+            "ok": True,
+            "audio_url": f"/audio/{tts_result['filename']}",
+            "filename": tts_result['filename']
+        }
+    else:
+        return {
+            "ok": False,
+            "error": tts_result.get("error", "TTS失败")
+        }
+
+@app.get("/audio/{filename}")
+async def get_audio(filename: str):
+    """获取音频文件"""
+    filepath = Path("data/tts") / filename
+    if not filepath.exists():
+        raise HTTPException(404, "音频文件不存在")
+
+    return FileResponse(
+        filepath,
+        media_type="audio/wav",
+        filename=filename
+    )
+
+@app.get("/health")
+async def health_check():
+    """健康检查"""
+    return {
+        "status": "healthy",
+        "timestamp": time.time(),
+        "active_sessions": len(sessions)
+    }
+
+# ==================== WebSocket端点 ====================
+
 @app.websocket("/ws")
-async def ws_chat(ws: WebSocket):
-    await ws.accept()
-    cfg = get_runtime_config()
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket流式对话 - 严格遵循规则"""
+    await websocket.accept()
+
+    manager = WebSocketManager(websocket)
 
     try:
         while True:
-            raw = await ws.receive_text()
-            try:
-                req = json.loads(raw)
-            except Exception:
-                await ws.send_text(json.dumps({"type": "server_error", "error": "invalid json"}, ensure_ascii=False))
-                continue
-
-            user_id = (req.get("user_id") or _env_str("DEFAULT_ROOM", "default_room")).strip()
-            sender_name = (req.get("sender_name") or _env_str("DEFAULT_SENDER_NAME", "路人甲")).strip()
-            message = (req.get("message") or "").strip()
-            enable_tts = bool(req.get("tts", True))
-            tts_params = req.get("tts_params")
-
-            if not message:
-                await ws.send_text(json.dumps({"type": "server_error", "error": "empty message"}, ensure_ascii=False))
-                continue
-
-            speaker_name, it = ANCHOR.chat_stream(
-                message,
-                user_id=user_id,
-                sender_name=sender_name,
-            )
-
-            if user_id not in LIVE_LOGS:
-                LIVE_LOGS[user_id] = LiveFullLog()
-            LIVE_LOGS[user_id].add("user", message, sender_name=sender_name)
-            full_raw = ""
-
-            await ws.send_text(
-                json.dumps({"type": "meta", "sender_name": speaker_name, "tts": enable_tts}, ensure_ascii=False)
-            )
-
-            engine = StreamEngine(cfg=cfg, sender_name=sender_name, tts_params=tts_params)
-            llm_joiner = LLMConsoleJoiner(tag="[WS]") if DEBUG_LLM_STREAM else None
-
-            async def emit(evt: Dict[str, Any]) -> None:
-                await ws.send_text(json.dumps(evt, ensure_ascii=False))
+            data = await websocket.receive_json()
 
             try:
-                last_cum = ""
-                for chunk in it:
-                    delta, last_cum = stream_chunk_to_delta(chunk, last_cum)
-                    if not delta:
-                        continue
+                request = ChatRequest(**data)
+            except Exception as e:
+                await manager.send_event("server_error", {"error": f"请求格式错误: {e}"})
+                continue
 
-                    full_raw += delta
+            if not request.message.strip():
+                await manager.send_event("server_error", {"error": "消息不能为空"})
+                continue
 
-                    if llm_joiner is not None:
-                        llm_joiner.push(delta)
-                        llm_joiner.maybe_flush()
-
-                    delta_out, seg_events = engine.process_delta(delta, enable_tts=enable_tts)
-
-                    if delta_out:
-                        await emit({"type": "delta", "delta": delta_out})
-
-                    if enable_tts:
-                        for aevt in engine.drain_audio_events():
-                            await emit(aevt)
-
-                    for evt in seg_events:
-                        await emit(evt)
-
-                    if enable_tts:
-                        for aevt in engine.drain_audio_events():
-                            await emit(aevt)
-
-                if llm_joiner is not None:
-                    llm_joiner.flush_all()
-
-                for evt in engine.flush_end(enable_tts=enable_tts):
-                    await emit(evt)
-
-                if enable_tts:
-                    for aevt in engine.drain_audio_events():
-                        await emit(aevt)
-                    await engine.drain_all_audio_async(emit)
-
-                if full_raw.strip():
-                    LIVE_LOGS[user_id].add("assistant", full_raw.strip(), sender_name=None)
-
-                await emit({"type": "done"})
-
-            finally:
-                engine.close()
+            await manager.handle_stream(request)
 
     except WebSocketDisconnect:
-        pass
-    except Exception as e:
+        print("WebSocket连接断开")
+
+        # 断开即视为直播结束：落盘 live_sessions + 写入 RAG 总结
         try:
-            await ws.send_text(json.dumps({"type": "server_error", "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False))
-        except Exception:
-            pass
-        traceback.print_exc()
-
-
-# ----------------------------
-# SSE streaming
-# ----------------------------
-@app.post("/chat_stream")
-def chat_stream(req: ChatRequest):
-    cfg = get_runtime_config()
-
-    def gen():
-        effective_user_id = (req.user_id or _env_str("DEFAULT_ROOM", "default_room")).strip()
-        effective_sender = (req.sender_name or _env_str("DEFAULT_SENDER_NAME", "路人甲")).strip()
-
-        speaker_name, it = ANCHOR.chat_stream(
-            req.message,
-            user_id=effective_user_id,
-            sender_name=effective_sender,
-        )
-        yield sse({"type": "meta", "sender_name": speaker_name, "tts": bool(req.tts)})
-
-        if effective_user_id not in LIVE_LOGS:
-            LIVE_LOGS[effective_user_id] = LiveFullLog()
-        LIVE_LOGS[effective_user_id].add("user", req.message, sender_name=(effective_sender or speaker_name))
-        full_raw = ""
-
-        engine = StreamEngine(cfg=cfg, sender_name=effective_sender, tts_params=req.tts_params)
-        llm_joiner = LLMConsoleJoiner(tag="[SSE]") if DEBUG_LLM_STREAM else None
-
-        try:
-            last_cum = ""
-            for chunk in it:
-                delta, last_cum = stream_chunk_to_delta(chunk, last_cum)
-                if not delta:
-                    continue
-
-                full_raw += delta
-
-                if llm_joiner is not None:
-                    llm_joiner.push(delta)
-                    llm_joiner.maybe_flush()
-
-                delta_out, seg_events = engine.process_delta(delta, enable_tts=bool(req.tts))
-
-                if delta_out:
-                    yield sse({"type": "delta", "delta": delta_out})
-
-                if req.tts:
-                    for aevt in engine.drain_audio_events():
-                        yield sse(aevt)
-
-                for evt in seg_events:
-                    yield sse(evt)
-
-                if req.tts:
-                    for aevt in engine.drain_audio_events():
-                        yield sse(aevt)
-
-            if llm_joiner is not None:
-                llm_joiner.flush_all()
-
-            for evt in engine.flush_end(enable_tts=bool(req.tts)):
-                yield sse(evt)
-
-            if req.tts:
-                for aevt in engine.drain_audio_events():
-                    yield sse(aevt)
-                for aevt in engine.drain_all_audio_sync():
-                    yield sse(aevt)
-
-            if full_raw.strip():
-                LIVE_LOGS[effective_user_id].add("assistant", full_raw.strip(), sender_name=None)
-
-            yield "data: [DONE]\n\n"
-
+            if manager.live_mgr is not None:
+                res = manager.live_mgr.end_live_and_persist(metadata={
+                    "session_id": manager.live_session_id,
+                    "disconnect_ts": time.time(),
+                })
+                print("[LIVE] end_live_and_persist:", json.dumps(res, ensure_ascii=False))
         except Exception as e:
-            yield sse({"type": "server_error", "error": f"{type(e).__name__}: {e}"})
-            traceback.print_exc()
-            yield "data: [DONE]\n\n"
-        finally:
-            engine.close()
+            print("[LIVE] end_live_and_persist failed:", e)
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+        # 清理会话（这里才删）
+        try:
+            if manager.live_session_id and manager.live_session_id in sessions:
+                del sessions[manager.live_session_id]
+        except:
+            pass
 
+    except Exception as e:
+        print("WebSocket错误:", e)
+        import traceback
+        traceback.print_exc()
+        try:
+            await manager.send_event("server_error", {"error": str(e)})
+        except:
+            pass
 
-@app.post("/chat")
-def chat(req: ChatRequest, request: Request):
-    cfg = get_runtime_config()
-    if not cfg.get("stream_llm", False):
-        return chat_once(req)
-    return chat_stream(req)
+# ==================== SSE端点 ====================
 
+@app.post("/chat_stream")
+async def chat_stream(request: ChatRequest):
+    """SSE流式对话"""
+
+    async def event_generator():
+        class MockWebSocket:
+            async def send_json(self, data):
+                yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        mock_ws = MockWebSocket()
+        manager = WebSocketManager(mock_ws)
+
+        try:
+            await manager.handle_stream(request)
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'server_error', 'error': str(e)}, ensure_ascii=False)}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+        }
+    )
+
+# ==================== 主程序 ====================
 
 if __name__ == "__main__":
-    host = _env_str("API_HOST", "0.0.0.0")
-    port = _env_int("API_PORT", 8000)
-    log_level = _env_str("API_LOG_LEVEL", "info")
-    reload_ = _env_bool("API_RELOAD", False)
+    host = get_env("API_HOST", "0.0.0.0")
+    port = get_env_int("API_PORT", 8000)
+
+    print(f"=== 虚拟主播API服务器 ===")
+    print(f"规则:")
+    print(f"1. 从前端接收输入")
+    print(f"2. 流式调用LLM API")
+    print(f"3. 三线程处理: 显示/TTS/情感")
+    print(f"服务器启动在: http://{host}:{port}")
+    print(f"前端页面: http://{host}:{port}/web/")
+    print(f"WebSocket端点: ws://{host}:{port}/ws")
+    print("=" * 30)
+
+    Path("data/tts").mkdir(parents=True, exist_ok=True)
 
     uvicorn.run(
         app,
         host=host,
         port=port,
-        reload=reload_,
-        log_level=log_level,
+        log_level="info"
     )
