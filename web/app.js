@@ -226,8 +226,23 @@ function startBotBubble(name = "主播") {
 }
 
 function appendBotDelta(delta) {
-  if (!currentBotBubbleTextEl) startBotBubble("主播");
-  currentBotBubbleTextEl.textContent += delta || "";
+  if (!delta) return;
+
+  if (!currentBotBubbleTextEl) {
+    startBotBubble("主播");
+  }
+
+  let text = delta;
+
+  // ✅ 如果是气泡刚开始，去掉前导空格
+  if (currentBotBubbleTextEl.textContent.length === 0) {
+    text = text.trimStart();
+  } else {
+    // ✅ 否则只去掉“多余的前导空格”
+    text = text.replace(/^\s+/, " ");
+  }
+
+  currentBotBubbleTextEl.textContent += text;
   chatEl.scrollTop = chatEl.scrollHeight;
 }
 
@@ -488,7 +503,7 @@ function connect() {
     if (obj.type === "meta") return;
 
     if (obj.type === "delta") {
-      appendBotDelta(obj.delta || "");
+      appendBotDelta(obj.delta || obj.text || obj.data || "");
       return;
     }
 
