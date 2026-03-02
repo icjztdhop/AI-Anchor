@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import locale
 import shlex
 import signal
 import socket
@@ -102,10 +103,12 @@ def _pump_stream(service: str, stream, is_err: bool, log_file: Path):
                 f.flush()
             except Exception:
                 pass
+            sys_enc = locale.getpreferredencoding(False)  # Windows 常见 cp936
+
             try:
-                s = line.decode("utf-8", errors="replace").rstrip("\n")
+                s = line.decode(sys_enc, errors="replace").rstrip("\n")
             except Exception:
-                s = str(line)
+                s = line.decode("utf-8", errors="replace").rstrip("\n")
             print(ctext(service, f"{prefix} {s}"), flush=True)
 
 def popen_realtime(service: str, argv: list[str], cwd: Path, env: dict):

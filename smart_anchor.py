@@ -276,6 +276,13 @@ class SmartVirtualAnchor:
         # ---------- GPT-SoVITS / TTS params (matches your config keys) ----------
         self.gptsovits_url = env_or_cfg(self.cfg, "GPTSOVITS_URL", "http://127.0.0.1:9880").rstrip("/")
         self.tts_ref_audio_path = env_or_cfg(self.cfg, "TTS_REF_AUDIO_PATH", "").strip()
+        # 如果是相对路径，自动转为绝对路径
+        if self.tts_ref_audio_path:
+            p = Path(self.tts_ref_audio_path)
+            if not p.is_absolute():
+                # 使用当前脚本执行目录
+                base_dir = Path(__file__).resolve().parent
+                self.tts_ref_audio_path = str((base_dir / p).resolve())
         self.tts_prompt_text = env_or_cfg(self.cfg, "TTS_PROMPT_TEXT", "为什么抛弃更高效更坚固的形态？").strip()
 
         self.tts_text_lang = env_or_cfg(self.cfg, "TTS_TEXT_LANG", "zh")
