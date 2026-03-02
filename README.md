@@ -58,24 +58,23 @@ git clone https://github.com/icjztdhop/AI-Anchor.git
 cd AI-Anchor
 ```
 
-###  创建并激活虚拟环境
+###  Windows使用install.bat一键安装
 
+双击 `install.bat`
+
+若提示未检测到python，拖入python.exe文件即可
+
+###  Linux安装方式
+
+创建虚拟环境
 ```bash
 python -m venv venv
 ```
-
-Windows：
-```bash
-.\venv\Scripts\Activate.ps1
-```
-
-Linux：
+进入环境
 ```bash
 source venv/bin/activate
 ```
-
-###  安装依赖
-
+安装依赖
 ```bash
 pip install -r requirements.txt
 ```
@@ -91,7 +90,7 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 ### LLM 模型（LMDeploy）
 
-1. 创建 `model/` 目录
+1. 创建 `model/` 目录（Windows自动脚本会自动创建）
 2. 放入 **LMDeploy 支持的模型**
 3. 推荐使用 **INT4 / AWQ 量化模型**
 
@@ -110,6 +109,10 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```text
 GPT-SoVITS/
 ```
+###  GPT-SoVITS精简版本（TTS）
+
+Releases的免安装包内使用精简版本
+比原有GPT-SoVITS包体积更小
 
 ---
 
@@ -134,27 +137,16 @@ Live2D/
 - 新手用户：**仅需修改模型路径即可启动**
 - 进阶用户：可调整 TTS、情绪系统、流式参数等
 
- 完整参数说明建议查看[独立文档](README_config.md)。
+ 完整参数说明建议查看[独立文档](CONFIG_GUIDE.md)。
 
 ---
 
 ##  启动项目
 
-Windows：
-```text
-双击 run.bat
-```
-或
+使用main.py启动
 ```bash
-run.ps1
+python main.py
 ```
-
-Linux：
-```bash
-./run.sh
-```
-
-启动成功后会出现 **3 个终端窗口**，均无报错即表示运行成功。
 
 ---
 
@@ -171,6 +163,13 @@ Linux：
 4. 点击 **连接 WS** 开始对话
 
 ---
+
+##  一些报错
+
+1、若lmdeploy启动失败，可能是缺少cudatoolkit
+2、（待补充）
+
+
 
 ##  未来计划
 
