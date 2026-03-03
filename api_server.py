@@ -16,6 +16,7 @@
 """
 
 import os
+import io
 import sys
 import json
 import time
@@ -37,6 +38,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="backslashreplace")
+    sys.stderr.reconfigure(errors="backslashreplace")
 
 try:
     from smart_anchor import SmartVirtualAnchor, load_config, cfg_bool, resolve_config_path
@@ -237,13 +242,21 @@ class ChatSession:
     tts_queue: Deque[StreamSegment] = field(default_factory=deque)
     display_queue: Deque[str] = field(default_factory=deque)
     emotion_queue: Deque[Dict[str, Any]] = field(default_factory=deque)
+    suppress_until_think_end: bool = True
+    think_end_probe: str = ""
+    think_buf: str = ""
+    in_think: bool = False
 
     def reset_buffers(self):
-        """重置缓冲区"""
+        """重置缓冲区（每条新消息开始前调用）"""
         self.text_buffer = ""
         self.display_buffer = ""
         self.bracket_buffer = ""
         self.in_bracket = False
+
+        # ✅ think 过滤状态：每轮开局默认抑制，直到检测到 </think>
+        self.suppress_until_think_end = True
+        self.think_end_probe = ""
 
 # ==================== 核心处理器 ====================
 
@@ -270,34 +283,11 @@ class StreamProcessor:
         # 情感检测
         self.emotion_pattern = re.compile(r"【emo=([^】]+)】", re.I)
 
-    def process_chunk(self, chunk: str) -> Tuple[str, List[StreamSegment], List[Dict[str, Any]]]:
-        """
-        处理LLM返回的一个chunk
-        返回: (显示文本, TTS分段列表, 情感事件列表)
-        """
-        display_chunks = []
-        tts_segments = []
-        emotion_events = []
-
-        with self.lock:
-            # 规则3a: 线程1 - 前端显示处理
-            # 删除开头的空格，删除中文大括号内的所有内容
-            display_text = self._process_for_display(chunk)
-            if display_text:
-                display_chunks.append(display_text)
-
-            # 规则3b: 线程2 - TTS分段处理
-            new_segments = self._process_for_tts(chunk)
-            tts_segments.extend(new_segments)
-
-            # 规则3c: 线程3 - 情感服务
-            new_emotions = self._process_emotions(chunk, new_segments)
-            emotion_events.extend(new_emotions)
-
-            return display_text, tts_segments, emotion_events
+        # ✅ think 结束标签（只检测结束，不检测开始）
+        self._think_end = "</think>"
 
     def _process_for_display(self, chunk: str) -> str:
-        """处理用于前端显示的文本"""
+        """处理用于前端显示的文本（chunk 已在 process_chunk 中做过 think 过滤）"""
         if not chunk:
             return ""
 
@@ -309,46 +299,64 @@ class StreamProcessor:
 
         return text
 
+    def process_chunk(self, chunk: str) -> Tuple[str, List[StreamSegment], List[Dict[str, Any]]]:
+        """
+        处理LLM返回的一个chunk
+        返回: (显示文本, TTS分段列表, 情感事件列表)
+        """
+        display_chunks = []
+        tts_segments: List[StreamSegment] = []
+        emotion_events: List[Dict[str, Any]] = []
+
+        with self.lock:
+            # ✅ 关键：think 过滤只做一次（有状态），避免 display/tts/emotion 各跑一遍导致状态错乱
+            clean_chunk = self._strip_think_streaming(chunk)
+            if not clean_chunk:
+                return "", [], []
+
+            # 线程1: 前端显示处理（这里不要再做 think 过滤）
+            display_text = self._process_for_display(clean_chunk)
+            if display_text:
+                display_chunks.append(display_text)
+
+            # 线程2: TTS分段处理（这里不要再做 think 过滤）
+            new_segments = self._process_for_tts(clean_chunk)
+            tts_segments.extend(new_segments)
+
+            # 线程3: 情感服务（这里不要再做 think 过滤）
+            new_emotions = self._process_emotions(clean_chunk, new_segments)
+            emotion_events.extend(new_emotions)
+
+            return display_text, tts_segments, emotion_events
+
     def _process_for_tts(self, chunk: str) -> List[StreamSegment]:
-        """处理用于TTS的文本"""
+        """处理用于TTS的文本（chunk 已经在 process_chunk 里做过 think 过滤）"""
         if not chunk:
             return []
 
-        segments = []
+        segments: List[StreamSegment] = []
 
-        # 处理字符流
         for char in chunk:
             if self.session.in_bracket:
-                # 在大括号内，添加到括号缓冲区
                 self.session.bracket_buffer += char
-
-                # 检查是否遇到结束括号
                 if char == "】":
                     self.session.in_bracket = False
-                    # 清空括号缓冲区（舍弃大括号内的所有内容）
                     self.session.bracket_buffer = ""
             else:
-                # 不在大括号内
                 if char == "【":
-                    # 开始大括号
                     self.session.in_bracket = True
                     self.session.bracket_buffer = char
                 else:
-                    # 正常字符，添加到文本缓冲区
                     self.session.text_buffer += char
 
-                    # 检查是否为分隔符
                     if re.match(SENTENCE_DELIMITERS, char):
-                        # 遇到分隔符，分割为一段
                         if self.session.text_buffer.strip():
                             segment = self._create_tts_segment(self.session.text_buffer)
                             if segment:
                                 segments.append(segment)
                             self.session.text_buffer = ""
 
-        # 检查缓冲区是否过长（防止缓冲区无限增长）
         if len(self.session.text_buffer) > 100:
-            # 强制分割
             segment = self._create_tts_segment(self.session.text_buffer)
             if segment:
                 segments.append(segment)
@@ -385,46 +393,37 @@ class StreamProcessor:
         )
 
     def _process_emotions(self, chunk: str, new_segments: List[StreamSegment]) -> List[Dict[str, Any]]:
-        """处理情感检测"""
+        """处理情感检测（chunk 已经在 process_chunk 里做过 think 过滤）"""
         if not self.emotion_config["enabled"]:
             return []
+        if not chunk:
+            return []
 
-        events = []
+        events: List[Dict[str, Any]] = []
 
-        # 在chunk中查找情感标签
         emotion_matches = list(self.emotion_pattern.finditer(chunk))
 
         if emotion_matches:
-            # 检测到情感标签
             for match in emotion_matches:
                 emotion = match.group(1)
-                # 检查情感是否在配置中
                 if emotion in self.emotion_config["labels"]:
-                    # 规则3c: 匹配上则发送情感信息
                     events.append({
                         "type": "emotion_detected",
                         "emotion": emotion,
                         "timestamp": time.time()
                     })
-
-                    # 重置计数
                     self.emotion_tts_count = 0
                     self.session.last_emotion_detected = time.time()
 
-            # 如果有新的TTS分段，为它们标记情感
             for segment in new_segments:
-                if emotion_matches:
-                    last_emotion = emotion_matches[-1].group(1)
-                    if last_emotion in self.emotion_config["labels"]:
-                        segment.emotion = last_emotion
-                        segment.has_emotion_tag = True
+                last_emotion = emotion_matches[-1].group(1)
+                if last_emotion in self.emotion_config["labels"]:
+                    segment.emotion = last_emotion
+                    segment.has_emotion_tag = True
         else:
-            # 没有检测到情感标签
             self.emotion_tts_count += len(new_segments)
 
-            # 规则3c: 若两次TTS发送还没有检测到中文大括号，则在第三次加入【emo=正常】
             if self.emotion_tts_count >= 3 and "正常" in self.emotion_config["labels"]:
-                # 为当前的分段添加默认情感
                 for segment in new_segments:
                     segment.emotion = "正常"
                     segment.has_emotion_tag = True
@@ -435,41 +434,144 @@ class StreamProcessor:
                     "reason": "连续3次TTS无情感标签",
                     "timestamp": time.time()
                 })
-
-                # 重置计数
                 self.emotion_tts_count = 0
 
         return events
 
     def flush_buffers(self) -> Tuple[List[StreamSegment], List[Dict[str, Any]]]:
         """流结束时清空剩余缓冲区"""
-        segments = []
-        emotions = []
+        segments: List[StreamSegment] = []
+        emotions: List[Dict[str, Any]] = []
+
+        # ✅ 如果还在抑制阶段（还没见到 </think>），直接丢弃所有缓冲，避免读出思考残片
+        if getattr(self.session, "suppress_until_think_end", True):
+            self.session.text_buffer = ""
+            self.session.bracket_buffer = ""
+            self.session.in_bracket = False
+            self.session.think_end_probe = ""
+            return segments, emotions
 
         # 处理剩余文本缓冲区
         remaining_text = self.session.text_buffer.strip()
         if remaining_text:
-            # 删除大括号内容
             clean_text = re.sub(CHINESE_BRACKET_PATTERN, "", remaining_text).strip()
+            clean_text = re.sub(r"\s+", "", clean_text).strip()
+            clean_text = clean_text.replace("</think>", "").replace("</THINK>", "")
 
             if clean_text:
                 # 如果没有结束标点，补一个句号
                 if not re.search(r"[。！？!?；;]$", clean_text):
                     clean_text += "。"
 
-                self.seq_counter += 1
-                segment = StreamSegment(
-                    seq=self.seq_counter,
-                    text=clean_text
-                )
-                segments.append(segment)
+                # 过滤：至少包含一个有效字符
+                if re.search(r"[A-Za-z0-9\u4e00-\u9fa5]", clean_text) and len(clean_text) > 1:
+                    self.seq_counter += 1
+                    segment = StreamSegment(
+                        seq=self.seq_counter,
+                        text=clean_text
+                    )
+                    segments.append(segment)
 
         # 清空缓冲区
         self.session.text_buffer = ""
         self.session.bracket_buffer = ""
         self.session.in_bracket = False
+        self.session.think_end_probe = ""
 
         return segments, emotions
+
+    def _strip_initial_think_until_end(self, chunk: str) -> str:
+        """
+        流式过滤：开局默认处于 suppress 模式，丢弃所有内容，直到检测到 </think>。
+        规则：
+        - 若在某一段输出检测到 '<'，就持续检测 '/think>'（即拼成 '</think>'）
+        - 若没有检测到完整 '</think>'，则继续寻找下一个 '<'
+        - 检测到完整 '</think>' 后，从标签之后开始才向外输出
+        - 支持标签跨 chunk 拆分
+        """
+        if not chunk:
+            return ""
+
+        # 已经解除抑制：直接透传
+        if not getattr(self.session, "suppress_until_think_end", True):
+            return chunk
+
+        out_chars: List[str] = []
+
+        for ch in chunk:
+            # 如果刚刚解除抑制，后续直接输出
+            if not self.session.suppress_until_think_end:
+                out_chars.append(ch)
+                continue
+
+            # 仍在抑制：只有遇到 '<' 才开始探测
+            if not self.session.think_end_probe:
+                if ch == "<":
+                    self.session.think_end_probe = "<"
+                continue
+
+            # 探测中：累积并检查
+            self.session.think_end_probe += ch
+            probe_lower = self.session.think_end_probe.lower()
+
+            # 命中完整 </think>：解除抑制，不输出标签本身
+            if probe_lower.endswith(self._think_end):
+                self.session.suppress_until_think_end = False
+                self.session.think_end_probe = ""
+                continue
+
+            # 若当前 probe 不是 '</think>' 的前缀 => 探测失败，回到“继续找 <”
+            # 注意：这里按“前缀匹配”实现你的规则
+            if not self._think_end.startswith(probe_lower):
+                # 如果当前字符本身是 '<'，那它可能是下一个标签开始，保留为新 probe
+                self.session.think_end_probe = "<" if ch == "<" else ""
+
+            # 防止 probe 无限增长（正常情况下不会太长，但做个保险）
+            if len(self.session.think_end_probe) > 32:
+                self.session.think_end_probe = self.session.think_end_probe[-32:]
+
+        return "".join(out_chars)
+
+    def _strip_think_streaming(self, chunk: str) -> str:
+        if not chunk:
+            return ""
+
+        out = []
+
+        for ch in chunk:
+            self.session.think_buf += ch
+            buf_low = self.session.think_buf.lower()
+
+            if self.session.in_think:
+                if buf_low.endswith("</think>"):
+                    self.session.in_think = False
+                    self.session.think_buf = ""
+                else:
+                    if len(self.session.think_buf) > 64:
+                        self.session.think_buf = self.session.think_buf[-64:]
+                continue
+
+            if buf_low.endswith("<think>"):
+                self.session.in_think = True
+                for _ in range(len("<think>")):
+                    if out:
+                        out.pop()
+                self.session.think_buf = ""
+                continue
+
+            if buf_low.endswith("</think>"):
+                for _ in range(len("</think>")):
+                    if out:
+                        out.pop()
+                self.session.think_buf = ""
+                continue
+
+            out.append(ch)
+
+            if len(self.session.think_buf) > 64:
+                self.session.think_buf = self.session.think_buf[-64:]
+
+        return "".join(out)
 
 # ==================== TTS管理器 ====================
 
@@ -691,6 +793,9 @@ class WebSocketManager:
         first_delta_sent = False
 
         async for chunk in async_llm_generator():
+            # ✅ 1) cmd/终端保留原始输出（含 <think>）
+            # 你想看到完整think，就打印原始chunk
+            print(chunk, end="", flush=True)
             display_text, tts_segments, emotion_events = self.processor.process_chunk(chunk)
 
             # 线程1: 发送显示文本到前端

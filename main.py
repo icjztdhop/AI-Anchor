@@ -1,4 +1,5 @@
 import os
+import io
 import sys
 import time
 import locale
@@ -10,6 +11,7 @@ import threading
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+
 
 # -------------------- paths --------------------
 ROOT = Path(__file__).resolve().parent
